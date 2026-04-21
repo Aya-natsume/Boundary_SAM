@@ -210,7 +210,7 @@ def assign_fine_boundary_labels(
             }
 
     规则说明：
-        1. 先对每个前景器官 A 构造二值 mask。
+        1. 先对每个类别构造二值 mask，这里包含背景 0。
         2. 再用形态学 inner boundary 提取候选边界带。
         3. 只在候选边界带内部做局部邻接判定，不做全图逐像素硬扫。
         4. 如果邻域内同时出现多个前景类别，则选择邻接像素数量最多的类别。
@@ -218,7 +218,10 @@ def assign_fine_boundary_labels(
         6. 当前函数输出的是“有序边界”：
            - 当前点属于 A，且邻域接触 B，则记为 (A, B)。
            - 同一条 A/B 几何边界，会同时拆成 (A, B) 与 (B, A) 两个集合。
-        7. 器官-器官边界优先于器官-背景边界，同一像素只会被分到一个边界类别。
+        7. 现在器官-背景边界会显式输出双向两侧：
+           - (A, 0): 器官 A 一侧接触背景
+           - (0, A): 背景一侧接触器官 A
+        8. 对任意当前类别 X，若邻域内同时出现前景类别与背景，则仍然优先分到“接触前景”的有序边界类别。
     """
     if seg_label.dim() != 3:  # 这里只接受 (B, H, W)，别让奇怪形状混进来。
         raise ValueError("seg_label must have shape (B, H, W)")
@@ -238,12 +241,12 @@ def assign_fine_boundary_labels(
     local_counts_hwk = local_counts.permute(0, 2, 3, 1).contiguous()  # 改成 (B, H, W, K) 后，按坐标索引取邻域计数会更顺手。
     boundary_coord_lists: DefaultDict[BoundaryKey, List[torch.Tensor]] = defaultdict(list)  # 先按列表暂存，最后统一堆叠。
 
-    for organ_class in range(1, num_classes):  # 背景 0 不作为当前主体器官，所以从 1 开始遍历。
-        organ_mask = seg_label == organ_class  # 当前器官 A 的二值区域。
+    for organ_class in range(num_classes):  # 这里现在显式包含背景 0，这样才能把 (0, A) 这一侧原型也建出来。
+        organ_mask = seg_label == organ_class  # 当前类别的二值区域，可能是背景，也可能是前景器官。
         if not organ_mask.any():  # 这个类别在当前 batch 里根本没出现时，直接跳过，别浪费算力。
             continue
 
-        candidate_boundary = extract_morph_boundary(organ_mask, kernel_size=boundary_kernel, mode="inner")  # 边界带厚度现在只由 boundary_kernel 控制。
+        candidate_boundary = extract_morph_boundary(organ_mask, kernel_size=boundary_kernel, mode="inner")  # 候选边界带厚度现在只由 boundary_kernel 控制。
         candidate_coords = torch.nonzero(candidate_boundary, as_tuple=False)  # 现在的坐标格式天然就是 [batch_idx, y, x]。
         if candidate_coords.numel() == 0:  # 当前器官没有候选边界时，继续下一个器官。
             continue
@@ -254,17 +257,17 @@ def assign_fine_boundary_labels(
             candidate_coords[:, 2],
         ]  # 一次性取出所有候选点的邻域类别计数，别逐点循环慢慢抠。
 
-        neighbor_counts = neighborhood_counts.clone()  # 后面要改写当前器官的计数，所以先复制一份，避免污染原图。
-        neighbor_counts[:, organ_class] = 0.0  # 当前像素自身所在器官不算“邻接边界对象”，否则每个点都会偏向自己。
+        neighbor_counts = neighborhood_counts.clone()  # 后面要改写当前类别自身的计数，所以先复制一份，避免污染原图。
+        neighbor_counts[:, organ_class] = 0.0  # 当前像素自身所在类别不算“邻接边界对象”，否则每个点都会偏向自己。
 
         foreground_neighbor_counts = neighbor_counts.clone()  # 前景优先逻辑要单独看一份前景计数。
-        foreground_neighbor_counts[:, 0] = 0.0  # 背景先暂时屏蔽掉，等前景决策做完再考虑。
+        foreground_neighbor_counts[:, 0] = 0.0  # 背景先暂时屏蔽掉，等“是否接触任何前景”这个判断做完再考虑。
 
         max_foreground_count, best_foreground_class = foreground_neighbor_counts.max(dim=1)  # 找到每个候选点最可能邻接的前景类别。
         background_count = neighbor_counts[:, 0]  # 背景计数单独拿出来，作为后备归类。
 
-        has_foreground_neighbor = max_foreground_count > 0  # 只要邻域里出现前景，就优先判成器官-器官边界。
-        has_background_neighbor = background_count > 0  # 如果没有前景但有背景，就判成器官-背景边界。
+        has_foreground_neighbor = max_foreground_count > 0  # 只要邻域里出现前景，就优先判成“当前侧 -> 某个前景”的有序边界。
+        has_background_neighbor = background_count > 0  # 如果没有前景但有背景，就退化成“当前侧 -> 背景”的有序边界。
         valid_mask = has_foreground_neighbor | has_background_neighbor  # 两者都没有时，这个点就不构成有效边界类别。
         if not valid_mask.any():  # 没有有效点就继续下一个器官。
             continue
@@ -274,6 +277,13 @@ def assign_fine_boundary_labels(
             best_foreground_class,
             torch.zeros_like(best_foreground_class),
         )  # 先按“前景优先，否则背景”的规则给每个点分一个唯一邻接类别。
+
+        # 一个关键点别漏了：
+        # 1. 当 organ_class > 0 时，这里会产生 (A, 0)，也就是“器官侧接触背景”。
+        # 2. 当 organ_class == 0 时，这里会产生 (0, A)，也就是“背景侧接触器官”。
+        # 3. 这正是后续为器官-背景边界构造双向 ordered prototype 所必需的那一半信息。
+        # 4. 虽然背景 mask 的 inner boundary 会在整张图边框附近也出现候选点，但那些位置通常没有前景邻居，
+        #    所以会被 valid_mask 自动筛掉，不会莫名其妙污染 (0, A) 原型。
 
         valid_coords = candidate_coords[valid_mask]  # 只保留真正能归类的点。
         valid_neighbor_class = assigned_neighbor_class[valid_mask]  # 这些点对应的邻接类别。
