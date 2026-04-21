@@ -66,6 +66,8 @@ def _prepare_binary_mask(binary_mask: torch.Tensor) -> Tuple[torch.Tensor, int]:
         original_dim: int
             输入张量的原始维度，用于后面恢复形状。
     """
+    # 这里先记住输入维度，后面恢复形状时不能悄悄改接口；
+    # 第一部分的调试脚本很多都默认输入输出维度严格对应。
     original_dim = binary_mask.dim()
     if original_dim == 2:
         mask_4d = binary_mask.unsqueeze(0).unsqueeze(0)
@@ -77,6 +79,8 @@ def _prepare_binary_mask(binary_mask: torch.Tensor) -> Tuple[torch.Tensor, int]:
         mask_4d = binary_mask
     else:
         raise ValueError("binary_mask must have shape (H, W), (1, H, W), (B, H, W), or (B, 1, H, W)")
+    # 后面的形态学实现依赖池化和卷积，统一转成 0/1 float 更稳；
+    # 这里如果保留 bool，很多算子也能跑，但后续数值组合会变得不够直观。
     mask_4d = (mask_4d > 0).to(dtype=torch.float32)
     return mask_4d, original_dim
 
@@ -123,12 +127,18 @@ def extract_morph_boundary(
         raise ValueError("mode must be either 'inner' or 'gradient'")
 
     mask_4d, original_dim = _prepare_binary_mask(binary_mask)
+    # 这里固定对称 padding，是为了保证边界带提取前后分辨率不变；
+    # 如果改成别的边界处理方式，后面坐标索引与 feature 对齐会一起漂。
     padding = kernel_size // 2
 
     dilated = F.max_pool2d(mask_4d, kernel_size=kernel_size, stride=1, padding=padding)
+    # 腐蚀这里用补集技巧实现，主要是为了保持依赖简单；
+    # 行为上等价，但别随手换成别的近似写法，不然 inner boundary 厚度会变。
     eroded = 1.0 - F.max_pool2d(1.0 - mask_4d, kernel_size=kernel_size, stride=1, padding=padding)
 
     if mode == "inner":
+        # 当前任务默认用 inner boundary，是因为边界点后面要归到“当前类别一侧”；
+        # 如果这里直接换成更厚的 gradient boundary，ordered 邻接判定会更容易混进对侧像素。
         boundary_4d = (mask_4d > 0.5) & (eroded < 0.5)
     else:
         boundary_4d = (dilated - eroded) > 0.0
@@ -151,6 +161,8 @@ def _build_local_class_count_map(seg_label: torch.Tensor, num_classes: int, kern
         local_counts: Tensor, shape = (B, num_classes, H, W)
             local_counts[b, k, y, x] 表示以 (y, x) 为中心的局部窗口内，类别 k 出现了多少个像素。
     """
+    # 这里先转 one-hot 再做分组卷积，目的是一次性得到所有类别的局部计数；
+    # 若改成逐类循环，逻辑虽然也能成立，但第一部分会慢很多。
     one_hot = F.one_hot(seg_label.long(), num_classes=num_classes).permute(0, 3, 1, 2).to(torch.float32)
     kernel = torch.ones(
         num_classes,
@@ -237,10 +249,14 @@ def assign_fine_boundary_labels(
     if num_classes <= 1:
         raise ValueError("num_classes must be larger than 1")
 
+    # 这里把“边界带厚度”和“邻域判定范围”拆成两个参数，是为了让几何提取和类别判定各自可调；
+    # 这两个量如果重新绑死，背景边界和器官间边界通常很难同时调稳。
     local_counts = _build_local_class_count_map(seg_label, num_classes=num_classes, kernel_size=neighbor_kernel)
     local_counts_hwk = local_counts.permute(0, 2, 3, 1).contiguous()
     boundary_coord_lists: DefaultDict[BoundaryKey, List[torch.Tensor]] = defaultdict(list)
 
+    # 这里显式遍历背景 0，不只是为了几何完整；
+    # 第二部分 prototype bank 现在要求 `(A,0)` 与 `(0,A)` 都能被稳定构造出来。
     for organ_class in range(num_classes):
         organ_mask = seg_label == organ_class
         if not organ_mask.any():
@@ -257,6 +273,7 @@ def assign_fine_boundary_labels(
             candidate_coords[:, 2],
         ]
 
+        # 当前类别自身不能被当成“邻接类别”，否则边界会退化成没有意义的 `(A,A)`。
         neighbor_counts = neighborhood_counts.clone()
         neighbor_counts[:, organ_class] = 0.0
 
@@ -285,6 +302,9 @@ def assign_fine_boundary_labels(
 
 
 
+        # 这里的 valid_mask 还有一个关键作用：
+        # 背景 outer frame 那种没有前景邻居的伪边界会在这里被扔掉，
+        # 否则 `(0,A)` 这类背景侧原型会被无关区域污染。
         valid_coords = candidate_coords[valid_mask]
         valid_neighbor_class = assigned_neighbor_class[valid_mask]
 
@@ -292,6 +312,8 @@ def assign_fine_boundary_labels(
         for neighbor_class in unique_neighbor_classes.tolist():
             class_mask = valid_neighbor_class == neighbor_class
             coords_this_key = valid_coords[class_mask]
+            # ordered key 的顺序不能动：
+            # 当前点属于 organ_class，邻域接触 neighbor_class，所以只能写成 `(organ_class, neighbor_class)`。
             boundary_key = canonicalize_ordered_boundary_key(organ_class, neighbor_class)
             boundary_coord_lists[boundary_key].append(coords_this_key)
 
@@ -320,6 +342,8 @@ def gather_point_features(feature_map: torch.Tensor, coords: torch.Tensor) -> to
     if coords.numel() == 0:
         return feature_map.new_zeros((0, channels))
 
+    # 这里必须统一转 long，因为后面走的是高级索引；
+    # 坐标如果保成 float，PyTorch 不会替你做隐式修正，只会直接报错。
     coords = coords.long()
     batch_idx = coords[:, 0]
     y_idx = coords[:, 1]
@@ -330,6 +354,7 @@ def gather_point_features(feature_map: torch.Tensor, coords: torch.Tensor) -> to
     if y_idx.min() < 0 or y_idx.max() >= height or x_idx.min() < 0 or x_idx.max() >= width:
         raise IndexError("coords spatial indices are out of range")
 
+    # 这里返回的形状固定是 `[N, C]`，后面 prototype 计算和净化流程都依赖这个约定。
     point_features = feature_map[batch_idx, :, y_idx, x_idx]
     return point_features
 
@@ -401,15 +426,20 @@ def filter_boundary_points_by_feature_consistency(
             }
             continue
 
+        # 这里先做点级 L2 normalize，再求类内均值原型；
+        # 如果跳过这一步，后面的相似度就会把向量长度也混进去，筛选会不稳定。
         normalized_features = F.normalize(point_features, p=2, dim=1, eps=1e-12)
         prototype = normalized_features.mean(dim=0)
         prototype = F.normalize(prototype.unsqueeze(0), p=2, dim=1, eps=1e-12).squeeze(0)
         similarity = torch.matmul(normalized_features, prototype)
 
+        # 点数太少时强行截断没有收益，反而容易把本来就稀疏的边界类直接筛空。
         skip_filter = raw_count < min_points or keep_ratio >= 1.0
         if skip_filter:
             keep_indices = torch.arange(raw_count, device=coords.device)
         else:
+            # 这里刻意用 ceil，是为了让细小边界类少丢一个算一个；
+            # 医学分割里的边界像素本来就不富裕，向下截断通常更伤。
             keep_count = max(1, math.ceil(raw_count * keep_ratio))
             keep_indices = torch.topk(similarity, k=keep_count, largest=True).indices
             keep_indices = keep_indices[torch.argsort(keep_indices)]

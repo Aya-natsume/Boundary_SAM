@@ -55,6 +55,8 @@ DEFAULT_STRIP_BOX_CONFIG: Dict[str, float | int] = {
     "strip_min_half_length": 10.0,
     "strip_max_half_length": 28.0,
 }
+# 这一组超参数只服务“几何构框”本身，不直接决定最终 prompt 数量。
+# 这里如果和第四步的分段策略混着调，调参结论通常会变得很难解释。
 
 
 def canonicalize_ordered_boundary_key(a: int, b: int) -> BoundaryKey:
@@ -132,6 +134,8 @@ def _parse_box(
         x_max = int(box["x_max"]) if "x_max" in box else int(box["x2"])
         y_max = int(box["y_max"]) if "y_max" in box else int(box["y2"])
 
+    # 这里强制闭区间坐标合法，是因为第三、四步都把 box 当像素级几何范围用；
+    # 一旦坐标顺序反了，后面切线坐标图和条带 mask 会整体失真。
     if x_max < x_min or y_max < y_min:
         raise ValueError("box must satisfy x_max >= x_min and y_max >= y_min")
     if batch_size is not None and not (0 <= batch_idx < batch_size):
@@ -215,6 +219,8 @@ def compute_ordered_similarity_in_box(
     h_box, w_box = _get_box_size(box_info)
 
     if prototype is None:
+        # 这里不直接报错，而是返回常数图，是为了让局部调试函数还能继续画；
+        # 但在真正的第三步主流程里，缺 prototype 仍然会被当成硬错误处理。
         fill_value = 0.0 if missing_proto_value is None else float(missing_proto_value)
         return torch.full((h_box, w_box), fill_value, dtype=torch.float32, device=feature_map.device)
 
@@ -222,6 +228,8 @@ def compute_ordered_similarity_in_box(
         raise ValueError(f"prototype must have shape ({channels},)")
 
     batch_idx = int(box_info["batch_idx"])
+    # 这里按 box 直接裁局部 feature，是为了把后续几何搜索限制在粗边界邻域；
+    # 新版第三步的目标就是“先构条带框”，不再回到全图做响应竞争。
     local_feature = feature_map[
         batch_idx,
         :,
@@ -272,6 +280,8 @@ def _build_boundary_response_from_probabilities(pa_box: torch.Tensor, pb_box: to
         boundary_response = pair_support * exp(-gap / temperature)
     """
     temperature = float(DEFAULT_STRIP_BOX_CONFIG["boundary_response_temperature"])
+    # 当前响应故意保持成 pair-wise 的局部粗边界先验：
+    # 只有 A/B 两类都至少有一点存在感的地方，才值得进入后面的切线/法线拟合。
     pair_support = torch.minimum(pa_box, pb_box)
     gap = torch.abs(pa_box - pb_box)
     boundary_response = pair_support * torch.exp(-gap / max(temperature, 1e-6))
@@ -354,6 +364,8 @@ def extract_local_center_point_from_coarse_boundary(
 
     coarse_points = _parse_boundary_coords(coarse_boundary_coords, batch_idx=batch_idx, box_info=box_info)
     if coarse_points is not None and coarse_points.size(0) > 0:
+        # 这里不是随便取均值，而是取“离边界点均值最近的真实边界点”；
+        # 这样做是为了保证中心点 `c` 仍然落在粗边界上，而不是飘到边界外的连续空间里。
         center_estimate = coarse_points.mean(dim=0)
         distances = torch.linalg.norm(coarse_points - center_estimate.unsqueeze(0), dim=1)
         selected_point = coarse_points[int(torch.argmin(distances).item())]
@@ -363,6 +375,7 @@ def extract_local_center_point_from_coarse_boundary(
             "x": float(selected_point[1].item()),
         }
 
+    # 如果上游没有直接给粗边界坐标，就退化成在 box 内从 pair response 里找一个几何中心。
     boundary_response = _build_boundary_response_from_probabilities(pa_box=pa_box, pb_box=pb_box)
     pair_support = torch.minimum(pa_box, pb_box)
     min_pair_support = float(DEFAULT_STRIP_BOX_CONFIG["boundary_min_pair_support"])
@@ -375,6 +388,7 @@ def extract_local_center_point_from_coarse_boundary(
         return {"batch_idx": batch_idx, "y": selected_y, "x": selected_x}
 
     quantile = float(DEFAULT_STRIP_BOX_CONFIG["boundary_response_quantile"])
+    # 这里用分位数而不是固定阈值，是为了减少不同病例之间概率标定差异带来的敏感性。
     threshold = float(torch.quantile(candidate_values, q=min(max(quantile, 0.0), 1.0)).item())
     top_mask = candidate_mask & (boundary_response >= threshold)
     top_coords_local = torch.nonzero(top_mask, as_tuple=False)
@@ -401,6 +415,7 @@ def extract_local_center_point_from_coarse_boundary(
         [top_coords_local[:, 0] + int(box_info["y_min"]), top_coords_local[:, 1] + int(box_info["x_min"])],
         dim=1,
     ).to(torch.float32)
+    # 先做一次加权中心，再回到最近的真实候选点，是为了同时兼顾稳定性和“点仍落在粗边界上”。
     weighted_center = (top_coords_global * top_scores.unsqueeze(1)).sum(dim=0) / top_scores.sum().clamp_min(1e-6)
     distances = torch.linalg.norm(top_coords_global - weighted_center.unsqueeze(0), dim=1)
     selected_point = top_coords_global[int(torch.argmin(distances).item())]
@@ -444,6 +459,8 @@ def extract_local_boundary_points_near_center(
 
     coarse_points = _parse_boundary_coords(coarse_boundary_coords, batch_idx=batch_idx, box_info=box_info)
     if coarse_points is None:
+        # 这里即使没有显式粗边界坐标，也不回退成全图搜索；
+        # 只要 A/B 两类在当前 box 内同时有支撑，就允许它们参与局部直线拟合。
         pair_support = torch.minimum(pa_box, pb_box)
         candidate_mask = pair_support >= float(DEFAULT_STRIP_BOX_CONFIG["boundary_min_pair_support"])
         candidate_coords_local = torch.nonzero(candidate_mask, as_tuple=False)
@@ -472,6 +489,8 @@ def extract_local_boundary_points_near_center(
 
     if candidate_coords_global.size(0) > topk_points:
 
+        # 这里同时考虑“边界响应高”和“离中心近”，是为了让切线拟合更偏向当前局部边界段；
+        # 如果只看响应，远处另一段边界也可能被混进来。
         ranking_score = candidate_scores - 0.03 * distances.to(candidate_scores.device)
         keep_indices = torch.topk(ranking_score, k=topk_points, largest=True).indices
         candidate_coords_global = candidate_coords_global[keep_indices]
@@ -567,6 +586,8 @@ def estimate_local_tangent_and_normal(
 
     center_tensor = torch.tensor([float(center_point["y"]), float(center_point["x"] )], dtype=torch.float32, device=boundary_points_global.device)
     centered_points = boundary_points_global.to(torch.float32) - center_tensor.unsqueeze(0)
+    # 用 PCA 拟合切线的前提是：中心点附近这小段粗边界近似局部直线。
+    # 这不是全局几何真理，但对条带框构造已经够用，而且比直接用两个点求方向稳得多。
     covariance = centered_points.transpose(0, 1) @ centered_points / max(int(centered_points.size(0)), 1)
     eigen_values, eigen_vectors = torch.linalg.eigh(covariance)
     tangent = eigen_vectors[:, int(torch.argmax(eigen_values).item())]
@@ -576,6 +597,8 @@ def estimate_local_tangent_and_normal(
     normal = torch.tensor([float(tangent[1].item()), -float(tangent[0].item())], dtype=torch.float32, device=tangent.device)
     normal = normal / normal.norm(p=2).clamp_min(1e-6)
 
+    # PCA 只能给出“法线方向的一条轴”，方向正负还不确定；
+    # 这里再用 ordered prototype 在法线两侧探测一次，确保最终方向从 A 指向 B。
     prototype_ab = _extract_prototype_from_library(prototype_library, a=a, b=b)
     prototype_ba = _extract_prototype_from_library(prototype_library, a=b, b=a)
     if prototype_ab is None or prototype_ba is None:
@@ -670,6 +693,8 @@ def sample_points_along_normal(
     direction = direction.to(torch.float32)
     direction = direction / direction.norm(p=2).clamp_min(1e-6)
 
+    # 采样距离上限直接截到当前粗 box 内，是为了保持第三步仍然只做“局部构框”；
+    # 如果这里跨出 box，条带框就会重新把全图噪声拉回来。
     max_distance = _distance_to_box_edge_along_direction(point_yx=center_tensor, direction_yx=direction, box_info=box_info)
     max_distance = max(0.0, max_distance - float(DEFAULT_STRIP_BOX_CONFIG["normal_scan_margin"]))
     if max_distance <= 1e-3:
@@ -745,6 +770,8 @@ def detect_similarity_changepoint(
     min_drop = float(DEFAULT_STRIP_BOX_CONFIG["curve_min_drop"]) if min_drop is None else float(min_drop)
     change_window = max(1, change_window)
 
+    # 变点检测不是全序列盲扫，而是“先找局部主峰，再往内部方向找突变”；
+    # 这样做是为了兼容中心点略有偏差时，相似度曲线可能先升后降的情况。
     peak_index = int(torch.argmax(smoothed_curve).item())
     candidate_scores: List[Tuple[float, int]] = []
     for index in range(peak_index, int(smoothed_curve.numel()) - 1):
@@ -792,11 +819,14 @@ def construct_strip_box_from_cutoffs(
     q_a_tensor = torch.tensor([float(q_a["y"]), float(q_a["x"])], dtype=torch.float32)
     q_b_tensor = torch.tensor([float(q_b["y"]), float(q_b["x"])], dtype=torch.float32)
 
+    # `q_a / q_b` 只定义法线方向上的两条边界线；
+    # 最终条带框仍然要回到“中心 + 切线半长 + 法线半宽”的参数化表示，第四步才好分段。
     strip_center = 0.5 * (q_a_tensor + q_b_tensor)
     half_width = 0.5 * float(torch.linalg.norm(q_b_tensor - q_a_tensor, ord=2).item())
     half_width += float(DEFAULT_STRIP_BOX_CONFIG["strip_normal_padding"])
     half_width = max(half_width, 1.5)
 
+    # 切线方向的半长直接由局部边界点投影范围决定，这样条带框会跟当前边界段长度自适应。
     relative_boundary = boundary_points_global.to(torch.float32) - strip_center.unsqueeze(0)
     tangent_projection = relative_boundary @ tangent_vector.to(torch.float32)
     if tangent_projection.numel() == 0:
@@ -1011,6 +1041,8 @@ def generate_ordered_core_points_in_box(
     prototype_ab = _extract_prototype_from_library(prototype_library, a=a, b=b)
     prototype_ba = _extract_prototype_from_library(prototype_library, a=b, b=a)
     if prototype_ab is None or prototype_ba is None:
+        # 新版第三步明确依赖双向 ordered prototype；
+        # 如果这里只有一侧，法线两侧的厚度截止点就没有对称定义了。
         raise RuntimeError(f"Missing ordered prototypes for pair ({a}, {b})")
 
     coarse_boundary_coords = box.get("boundary_coords") if isinstance(box, dict) else None
@@ -1099,6 +1131,8 @@ def generate_ordered_core_points_in_box(
         missing_proto_value=0.0,
     )
     if use_soft_uncertainty:
+        # 这里的 soft uncertainty 只是局部加权，不改变第三步的主几何定义；
+        # 第一版默认仍然建议先看纯 prototype 相似度版本。
         pa_strip, pb_strip, _ = _crop_pair_probability_maps(prob_map=prob_map, box=strip_box, a=int(a), b=int(b))
         pair_support_strip = torch.minimum(pa_strip, pb_strip)
         response_a_box = response_a_box * pair_support_strip
@@ -1112,6 +1146,7 @@ def generate_ordered_core_points_in_box(
     strip_box["strip_mask_box"] = strip_mask_box
 
 
+    # 这些调试字段直接挂在 strip box 里，是为了让第四步和单图可视化只拿 box 就能复现整条几何链路。
     strip_box["boundary_points_global"] = boundary_info["boundary_points_global"]
     strip_box["normal_samples_a"] = samples_a
     strip_box["normal_samples_b"] = samples_b

@@ -17,6 +17,8 @@ def _make_conv_norm_relu(
     stride: int = 1,
 ) -> nn.Sequential:
     """构建一个最基础的 Conv-GN-ReLU 模块。"""
+    # 这里的卷积块结构看起来普通，但它其实承担“旧权重兼容”的约束；
+    # 一旦随手改 kernel、padding 或归一化类型，预训练权重基本就不能直接用了。
     return nn.Sequential(
         nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1),
         nn.GroupNorm(32, out_channels),
@@ -39,6 +41,8 @@ class ResBlock(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, out: torch.Tensor) -> torch.Tensor:
+        # 残差分支这里保持最朴素的 `x + F(x)`；
+        # 这不是保守，而是为了和旧项目权重的张量形状严格对齐。
         out = out + self.block(out)
         out = self.relu(out)
         return out
@@ -67,6 +71,8 @@ class Encoder(nn.Module):
         self.res1 = ResBlock(256)
         self.res2 = ResBlock(256)
         self.res3 = ResBlock(256)
+        # 这里保留成员名 `IN`，不是命名随意；
+        # 某些旧 checkpoint 直接依赖这个键名，改名会让加载报告变脏。
         self.IN = nn.InstanceNorm2d(256, affine=False, track_running_stats=False)
         self.relu = nn.ReLU(inplace=True)
 
@@ -79,6 +85,8 @@ class Encoder(nn.Module):
         out2 = self.block2(out1)
         out3 = self.block3(out2)
         if use_multi_feature:
+            # 多层特征只给需要中间监督或分析的路径用；
+            # 默认主干仍然只返回最深层编码表示，避免训练接口分叉太多。
             return out1, out2, out3
         out = self.res1(out3)
         out = self.res2(out)
@@ -129,6 +137,7 @@ class Decoder(nn.Module):
         out = self.block2(out)
         out = self.block3(out)
         if Seg_D2:
+            # 这里返回归一化特征而不是 logits，是为了兼容旧实验里把解码特征拿去做额外约束的路径。
             return F.normalize(out, dim=1)
         out = self.block4(out)
         return out
@@ -156,6 +165,8 @@ class BoundarySegmentationModel(nn.Module):
         """分别加载编码器和解码器的预训练参数。"""
         load_report: Dict[str, Tuple[str, ...]] = {}
         if encoder_checkpoint is not None:
+            # 这里把 missing/unexpected keys 都显式回传，是为了让旧权重兼容问题尽早暴露；
+            # 与其静默吞掉，不如让调用方马上看到哪里不匹配。
             incompatible = load_pretrained_weights(self.encoder, encoder_checkpoint, strict=strict, map_location=map_location)
             load_report["encoder_missing"] = tuple(incompatible.missing_keys)
             load_report["encoder_unexpected"] = tuple(incompatible.unexpected_keys)
@@ -179,6 +190,8 @@ def _strip_module_prefix(state_dict: Mapping[str, torch.Tensor]) -> "OrderedDict
     """去掉 DataParallel 留下的 module. 前缀。"""
     cleaned_state_dict: "OrderedDict[str, torch.Tensor]" = OrderedDict()
     for key, value in state_dict.items():
+        # DataParallel 留下的 `module.` 前缀只影响键名，不影响权重本身；
+        # 这里统一去掉，是为了让单卡和多卡 checkpoint 都能走同一条加载路径。
         new_key = key[7:] if key.startswith("module.") else key
         cleaned_state_dict[new_key] = value
     return cleaned_state_dict
@@ -196,4 +209,3 @@ def load_pretrained_weights(
     state_dict = _strip_module_prefix(state_dict)
     incompatible = module.load_state_dict(state_dict, strict=strict)
     return incompatible
-

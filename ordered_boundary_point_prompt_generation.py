@@ -31,6 +31,8 @@ DEFAULT_SEGMENT_PROMPT_CONFIG: Dict[str, float | int | bool] = {
     "center_exclusion_ratio": 0.12,
     "use_probability_weight": False,
 }
+# 第四步这里只负责“在条带框里均匀取点”，所以参数故意保持很少；
+# 和条带框构造相关的几何超参数应当留在第三步，别再把职责缠回去。
 
 
 def _parse_box(box: BoxDict) -> Dict[str, int]:
@@ -136,6 +138,8 @@ def compute_local_boundary_direction(core_ab: PointDict, core_ba: PointDict, eps
 
 def _extract_required_strip_data(box: BoxDict) -> Dict[str, object]:
     """从第三步输出的 box 中取出第四步真正需要的条带框数据。"""
+    # 这里明确要求第三步已经把条带框几何和 ordered 响应算完；
+    # 第四步只消费这些结果，不再重复推导法线、厚度或局部边界。
     required_tensor_keys = ["response_a_box", "response_b_box", "tangent_coord_box", "normal_coord_box", "strip_mask_box"]
     missing_keys = [key for key in required_tensor_keys if key not in box]
     if missing_keys:
@@ -188,6 +192,8 @@ def split_strip_box_along_tangent(box: BoxDict, num_segments: int) -> List[Dict[
     strip_mask_box = strip_data["strip_mask_box"]
     half_length = float(strip_data["strip_half_length"])
 
+    # 分段只沿切线方向做，法线厚度保持整段共享；
+    # 这正是新版第四步和旧版“二维 top-k 取点”最本质的差别。
     edges = torch.linspace(-half_length, half_length, steps=int(num_segments) + 1, dtype=torch.float32)
     segment_list: List[Dict[str, object]] = []
     for segment_index in range(int(num_segments)):
@@ -265,6 +271,8 @@ def select_best_prompt_in_strip_segment(
     if response_box.shape != segment_mask.shape or response_box.shape != normal_coord_box.shape:
         raise ValueError("response_box, segment_mask, and normal_coord_box must share the same shape")
 
+    # 这里先挖掉中心线附近一小条带，是为了避免正负点都压在边界本身；
+    # SAM 更需要站在边界两侧的支持点，而不是继续重复边界像素。
     center_exclusion = float(DEFAULT_SEGMENT_PROMPT_CONFIG["center_exclusion_ratio"]) * float(box["strip_half_width"])
     if side_name == "a":
         side_mask = normal_coord_box <= -center_exclusion
@@ -273,7 +281,8 @@ def select_best_prompt_in_strip_segment(
 
     valid_mask = segment_mask & side_mask
     if not bool(valid_mask.any()):
-
+        # 如果严格排除中心线后这一段没有点，就退一步允许整半带参与；
+        # 这样做的前提是第三步条带框已经把两侧厚度限制住了，不会轻易跨到远处无关区域。
         if side_name == "a":
             valid_mask = segment_mask & (normal_coord_box <= 0.0)
         else:
@@ -281,6 +290,8 @@ def select_best_prompt_in_strip_segment(
     if not bool(valid_mask.any()):
         return None
 
+    # 这里每段只留一个点，不做 top-k；
+    # 分散性由“切线分段”保证，而不是靠同一块局部区域里的 NMS 去勉强维持。
     masked_scores = response_box.clone()
     masked_scores[~valid_mask] = -1e8
     flat_index = int(torch.argmax(masked_scores.reshape(-1)).item())
@@ -381,6 +392,8 @@ def generate_point_prompts_from_ordered_cores(
     strip_mask_box = strip_data["strip_mask_box"]
 
     if bool(DEFAULT_SEGMENT_PROMPT_CONFIG["use_probability_weight"]):
+        # 第一版默认不乘概率，是为了先把“纯 ordered prototype 响应”链路看清楚；
+        # 后面若要叠概率，也应该只是轻量加权，而不是重新引入硬门控。
         prob_a_box = _crop_probability_box(prob_map=prob_map, box=box, class_idx=int(a))
         prob_b_box = _crop_probability_box(prob_map=prob_map, box=box, class_idx=int(b))
         response_a_box = response_a_box * prob_a_box
@@ -391,6 +404,8 @@ def generate_point_prompts_from_ordered_cores(
     raw_points_a: List[Dict[str, int | float]] = []
     raw_points_b: List[Dict[str, int | float]] = []
     for segment in segments:
+        # 每段 A/B 各取一个点，这样输出数量天然和边界长度相关；
+        # 比起在整个条带里一次性抢分，更容易得到沿边界均匀铺开的 prompts。
         best_a = select_best_prompt_in_strip_segment(
             response_box=response_a_box,
             segment_mask=segment["mask"],
@@ -423,6 +438,8 @@ def generate_point_prompts_from_ordered_cores(
         "y": float(box.get("strip_center_y", 0.5 * (box_info["y_min"] + box_info["y_max"]))),
         "x": float(box.get("strip_center_x", 0.5 * (box_info["x_min"] + box_info["x_max"]))),
     })
+    # 这里保留旧字段名 `ref_center_a / ref_center_b` 只是为了兼容外部入口；
+    # 在新版语义下，它们更接近第三步的 `q_a / q_b`，而不是旧版的窗口中心。
     ref_center_a = dict(core_ab)
     ref_center_b = dict(core_ba)
     direction_vector = compute_local_boundary_direction(core_ab=core_ab, core_ba=core_ba)
@@ -458,6 +475,8 @@ def generate_point_prompts_from_ordered_cores(
         "points_a": points_a,
         "points_b": points_b,
 
+        # 这里继续输出 `window_a / window_b` 只是为了兼容老调用方；
+        # 新版第四步实际只有一个条带框，不再有“两侧各自独立窗口”的几何对象。
         "window_a": box,
         "window_b": box,
         "score_map_a_window": response_a_box,

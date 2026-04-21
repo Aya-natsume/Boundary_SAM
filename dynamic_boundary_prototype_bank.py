@@ -48,6 +48,8 @@ def _l2_normalize_vector(vector: torch.Tensor, eps: float = 1e-12) -> torch.Tens
     """对单个向量做 L2 normalize。"""
     if vector.dim() != 1:
         raise ValueError("vector must have shape (C,)")
+    # 这里单独封成 helper，不只是为了少写一行；
+    # 更重要的是 bank 更新、加载和图级原型计算都要共用同一套归一化约定。
     return F.normalize(vector.unsqueeze(0), p=2, dim=1, eps=eps).squeeze(0)
 
 
@@ -96,6 +98,8 @@ def compute_image_level_boundary_prototypes(
     image_proto_dict: ImagePrototypeDict = {}
 
     for raw_key, boundary_data in filtered_boundary_dict.items():
+        # 这里每个 ordered key 必须独立处理；
+        # 一旦把 `(A,B)` 与 `(B,A)` 混合，后面第三步沿法线两侧做相似度扫描就会失去方向性。
         boundary_key = canonicalize_ordered_boundary_key(raw_key[0], raw_key[1])
         coords = boundary_data.get("coords")
         features = boundary_data.get("features")
@@ -124,8 +128,11 @@ def compute_image_level_boundary_prototypes(
                 continue
 
             if not feature_already_normalized:
+                # 这里只在必要时补一次点级归一化，避免外部已经归一化过时重复改尺度。
                 image_features = F.normalize(image_features, p=2, dim=1, eps=1e-12)
 
+            # 图级 prototype 这里仍然用简单均值，是因为当前 bank 只承担“主方向锚定”角色；
+            # 在没有明确多原型需求前，先别把第二部分复杂化。
             image_proto = image_features.mean(dim=0)
             image_proto = _l2_normalize_vector(image_proto)
 
@@ -174,6 +181,8 @@ class DynamicBoundaryPrototypeBank:
         if not (0.0 <= momentum < 1.0):
             raise ValueError("momentum must be in the range [0, 1)")
 
+        # bank 的 feature_dim 一旦确定，后面所有加载和更新都按这个维度校验；
+        # 如果这里放松检查，错维度权重会在更后面的阶段才炸，排查会很麻烦。
         self.feature_dim = int(feature_dim)
         self.momentum = float(momentum)
         self.ordered = True
@@ -211,10 +220,13 @@ class DynamicBoundaryPrototypeBank:
                         f"image_proto for boundary {boundary_key} must have shape ({self.feature_dim},)"
                     )
 
+                # 更新前先把图级 prototype 拉到 bank 所在设备上，避免 EMA 时设备不一致。
                 image_proto = image_proto.to(self.device, dtype=torch.float32)
                 image_proto = _l2_normalize_vector(image_proto)
 
                 if boundary_key not in self.bank:
+                    # 新 key 首次出现时直接注册，不做冷启动平均；
+                    # 边界类本来就稀疏，首帧如果再被过度平滑，方向信息会更弱。
                     bank_prototype = image_proto.clone()
                     update_count = 1
                     point_count_total = int(num_points)
@@ -222,6 +234,8 @@ class DynamicBoundaryPrototypeBank:
                     old_prototype = self.bank[boundary_key]["prototype"]
                     if not isinstance(old_prototype, torch.Tensor):
                         raise TypeError(f"stored prototype for boundary {boundary_key} must be a torch.Tensor")
+                    # 这里保持标准 EMA 更新，原因是 bank 要兼顾稳定和新样本适应；
+                    # 若直接改成简单均值，早期 noisy batch 会更容易长期污染 prototype。
                     bank_prototype = self.momentum * old_prototype + (1.0 - self.momentum) * image_proto
                     bank_prototype = _l2_normalize_vector(bank_prototype)
                     update_count = int(self.bank[boundary_key]["update_count"]) + 1
@@ -255,6 +269,7 @@ class DynamicBoundaryPrototypeBank:
             prototype: Optional[Tensor]
                 如果存在则返回 Tensor[C]，否则返回 None。
         """
+        # 访问时也统一走 ordered key 规范化，避免调用方传入 tuple 顺序不一致。
         boundary_key = self._normalize_key(a, b)
         if boundary_key not in self.bank:
             return None
@@ -291,6 +306,8 @@ class DynamicBoundaryPrototypeBank:
         self.momentum = float(state["momentum"])
         saved_ordered = bool(state.get("ordered", True))
         if not saved_ordered:
+            # 当前仓库后面的第三、四步都依赖 ordered prototype；
+            # 因此这里明确拒绝旧的 unordered 状态，免得把语义错误带到后面。
             raise ValueError("Only ordered boundary prototype banks are supported now.")
         self.ordered = True
         if "device" in state:

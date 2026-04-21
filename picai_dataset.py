@@ -23,6 +23,8 @@ def random_rot_flip(image: np.ndarray, label: Optional[np.ndarray] = None) -> Tu
     rotate_k = np.random.randint(0, 4)
     flip_axis = np.random.randint(0, 2)
     image = np.rot90(image, rotate_k)
+    # `np.flip` 返回的常常是带负 stride 的视图，后面直接转 tensor 会不太稳；
+    # 这里显式 `.copy()`，是为了把增强输出固定成连续内存。
     image = np.flip(image, axis=flip_axis).copy()
     if label is None:
         return image, None
@@ -34,6 +36,8 @@ def random_rot_flip(image: np.ndarray, label: Optional[np.ndarray] = None) -> Tu
 def random_rotate(image: np.ndarray, label: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """随机小角度旋转，增强视角扰动。"""
     angle = np.random.randint(-20, 21)
+    # 图像和标签这里故意用不同插值阶数：
+    # 图像保连续强度，标签保离散类别语义，这个前提最好别动。
     image = ndimage.rotate(image, angle, order=1, reshape=False)
     if label is None:
         return image, None
@@ -48,6 +52,8 @@ def gamma_correction(image: np.ndarray) -> np.ndarray:
     if image_max <= image_min:
         return image
     gamma = float(np.random.uniform(0.7, 1.5))
+    # gamma 之前先压到 0~1，是为了让同一组参数在不同病例上有一致含义；
+    # 否则原始强度范围差异会把增强幅度放大得很难控。
     image = (image - image_min) / (image_max - image_min)
     if np.random.rand() < 0.5:
         image = 1.0 - image
@@ -89,6 +95,8 @@ class RandomSliceTransform:
         IntensityAug: bool = True,
         NonlinearAug: bool = False,
     ) -> None:
+        # 这里保留旧参数名 `SpatialAug / IntensityAug / NonlinearAug`，
+        # 主要是为了兼容现有训练配置；数据层不适合顺手改外部接口。
         self.output_size = tuple(output_size)
         self.spatial_aug = SpatialAug
         self.intensity_aug = IntensityAug
@@ -98,6 +106,7 @@ class RandomSliceTransform:
         """把切片缩放到目标大小。"""
         height, width = image.shape
         target_h, target_w = self.output_size
+        # 缩放统一放在增强链末端，是为了让前面的空间扰动仍然发生在原始像素几何上。
         image = zoom(image, (target_h / height, target_w / width), order=1)
         if label is None:
             return image, None
@@ -155,6 +164,8 @@ class PICAIUnpairedSliceDataset(Dataset):
         if self.n_slices < 1:
             raise ValueError("n_slices must be >= 1")
 
+        # 训练阶段这里固定读取 unpaired 文件；
+        # 如果数据命名约定变了，训练和评估脚本要一起核对，别只改这一处。
         self.file_path = self.data_root / f"unpaired_{self.modality}.h5"
         self._file: Optional[h5py.File] = None
 
@@ -171,6 +182,7 @@ class PICAIUnpairedSliceDataset(Dataset):
     def _get_file(self) -> h5py.File:
         """按需打开 h5 文件。"""
         if self._file is None:
+            # h5 句柄延迟打开，是为了减少 DataLoader 多进程下的文件句柄复用问题。
             self._file = h5py.File(self.file_path, "r")
         return self._file
 
@@ -186,6 +198,8 @@ class PICAIUnpairedSliceDataset(Dataset):
             return image_tensor, label_tensor
 
         if label is None:
+            # 无标签路径主要服务目标域或调试场景；
+            # 这里仍然逐 slice 跑 transform，是为了让图像增强行为和有标签路径保持一致。
             image_list = []
             for slice_index in range(self.n_slices):
                 dummy_label = np.zeros_like(image[slice_index], dtype=np.int64)
@@ -213,6 +227,8 @@ class PICAIUnpairedSliceDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         data_file = self._get_file()
+        # 数据集长度按“病人 × 可滑动窗口数”定义；
+        # 这里的索引拆解规则如果改掉，训练采样分布也会跟着变。
         patient_index = index // self.window_count
         slice_index = index % self.window_count
 
@@ -318,4 +334,3 @@ class PICAITestDataset(PICAIPairedVolumeDataset):
 
 
 RandomGenerator = RandomSliceTransform
-

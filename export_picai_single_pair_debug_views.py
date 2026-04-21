@@ -26,6 +26,8 @@ def export_single_pair_debug_views(save_dir: str | Path) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     se_source, seg_decoder = load_reference_source_models(device=device)
+    # 这里直接复用项目里现成的 reference subset 建 bank，
+    # 目的是让单 pair 调试图尽量反映真实实验链路，而不是再造一套独立流程。
     bank = build_boundary_prototype_bank_from_reference_subset(
         device=device,
         se_source=se_source,
@@ -82,6 +84,8 @@ def export_single_pair_debug_views(save_dir: str | Path) -> None:
                     f"_pair_{a}_{b}_{geometry_name}.png"
                 )
 
+                # 这里显式把第三、四步的调试字段都透传下去，
+                # 是为了保证单图里能同时看到几何构框和最终取点，不需要再手动拼图。
                 visualize_point_prompts_in_box(
                     image_or_mask_2d=background_2d,
                     box=result["box"],
