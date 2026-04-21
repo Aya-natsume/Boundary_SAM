@@ -40,9 +40,19 @@ from dynamic_boundary_prototype_bank import (
     compute_image_level_boundary_prototypes,
     update_boundary_prototype_bank_from_filtered_points,
 )
+from ordered_boundary_prompt_score import (
+    canonicalize_ordered_boundary_key,
+    compute_all_ordered_boundary_scores,
+    extract_ordered_boundary_prompt_seeds,
+    generate_ordered_core_points_for_boxes,
+)
+from ordered_boundary_point_prompt_generation import (
+    generate_point_prompts_for_box_list,
+)
 from source_fine_boundary_points import (
     BoundaryDict,
     BoundaryKey,
+    assign_fine_boundary_labels,
     build_source_fine_boundary_points,
     gather_point_features,
     visualize_fine_boundary_points,
@@ -204,6 +214,175 @@ def extract_pretrained_feature_map(
         image_batch = image_batch.to(device)  # 输入搬到模型所在设备。
         feature_map = seg_decoder(se_source(image_batch), Seg_D2=True)  # 完全对齐 train.py 里注释过的 source_features 写法。
     return feature_map.detach().cpu()  # 后续边界划分和可视化都放到 CPU 就够了。
+
+
+def extract_pretrained_logits_and_feature_map(
+    image_batch: torch.Tensor,
+    se_source: Encoder,
+    seg_decoder: Decoder,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """同时提取分割 logits 与边界特征图。
+
+    输入：
+        image_batch: Tensor, shape = (1, 1, H, W)
+            单张 PICAI 切片。
+        se_source: Encoder
+            预训练源域编码器。
+        seg_decoder: Decoder
+            预训练分割解码器。
+        device: torch.device
+            模型运行设备。
+
+    输出：
+        seg_logits: Tensor, shape = (1, K, H, W)
+            分割 logits。
+        feature_map: Tensor, shape = (1, C, H, W)
+            `Seg_D2=True` 输出的边界特征图。
+    """
+    with torch.no_grad():  # 可视化只做前向，不需要梯度。
+        image_batch = image_batch.to(device)  # 输入先搬到模型设备。
+        encoded = se_source(image_batch)  # 参考训练脚本，先过编码器。
+        seg_logits = seg_decoder(encoded)  # 正常分割分支的 logits。
+        feature_map = seg_decoder(encoded, Seg_D2=True)  # 边界特征分支。
+    return seg_logits.detach().cpu(), feature_map.detach().cpu()
+
+
+def build_boundary_mask_dict_from_boundary_dict(
+    boundary_dict: BoundaryDict,
+    batch_size: int,
+    height: int,
+    width: int,
+) -> Dict[BoundaryKey, torch.Tensor]:
+    """把 ordered boundary 坐标字典转成布尔 mask 字典。
+
+    输入：
+        boundary_dict: dict
+            ordered boundary 字典，至少包含 `coords: Tensor[N, 3]`。
+        batch_size: int
+            批大小。
+        height: int
+            图像高度。
+        width: int
+            图像宽度。
+
+    输出：
+        boundary_mask_dict: dict
+            形式为：
+            {
+                (A, B): Tensor[B, H, W],   # bool
+                ...
+            }
+    """
+    boundary_mask_dict: Dict[BoundaryKey, torch.Tensor] = {}
+    for boundary_key, boundary_data in boundary_dict.items():  # 每个有序边界类别单独建一张 mask。
+        coords = boundary_data.get("coords")
+        if not isinstance(coords, torch.Tensor):
+            raise TypeError(f"boundary_dict[{boundary_key}]['coords'] must be a torch.Tensor")
+        mask = torch.zeros((batch_size, height, width), dtype=torch.bool)  # 当前有序边界类别的空间 mask。
+        if coords.numel() > 0:
+            coords = coords.long()
+            mask[coords[:, 0], coords[:, 1], coords[:, 2]] = True  # 直接按坐标回填成空间 mask。
+        boundary_mask_dict[boundary_key] = mask
+    return boundary_mask_dict
+
+
+def build_pair_box_prompt_dict_from_score_dict(
+    score_dict: Dict[BoundaryKey, torch.Tensor],
+    candidate_mask_dict: Dict[BoundaryKey, torch.Tensor],
+    box_quantile: float = 0.80,
+    min_pixels: int = 4,
+    padding: int = 6,
+) -> Dict[Tuple[int, int], Dict[str, int | float | Tuple[int, int] | Tuple[BoundaryKey, ...]]]:
+    """从 ordered score 图中提取 pair-level box prompt。
+
+    设计选择：
+        1. point prompt 保持 ordered，也就是 `(A,B)` 与 `(B,A)` 分开。
+        2. box prompt 更适合作为一个局部 conflict 区域，因此这里把 `(A,B)` 与 `(B,A)` 两侧高响应区域合并成一个 pair-level box。
+        3. 这个 box 只是为了把局部边界区域框出来，不承担左右方向语义。
+
+    输入：
+        score_dict: dict
+            ordered score 字典：
+            {
+                (A, B): Tensor[B, H, W],
+                ...
+            }
+        candidate_mask_dict: dict
+            ordered candidate mask 字典，与 score_dict 对齐。
+        box_quantile: float
+            在当前 ordered score 的有效区域内，取高分分位数作为 box 区域阈值。
+        min_pixels: int
+            至少多少个高分像素才认为能稳定地产生一个 box。
+        padding: int
+            box 四周的额外外扩像素。
+
+    输出：
+        pair_box_prompt_dict: dict
+            形式为：
+            {
+                (min_class, max_class): {
+                    "box": (x1, y1, x2, y2),
+                    "ordered_keys": ((A, B), (B, A)),
+                    "num_pixels": int,
+                    "score_threshold": float,
+                }
+            }
+    """
+    pair_region_dict: Dict[Tuple[int, int], torch.Tensor] = {}  # pair 级高分区域先临时累计在这里。
+    pair_meta_dict: Dict[Tuple[int, int], Dict[str, object]] = {}  # box 的元信息也顺手记下来。
+
+    for boundary_key, score_map in score_dict.items():  # 每个 ordered key 先单独提它的一侧高分区域。
+        if boundary_key not in candidate_mask_dict:
+            continue
+        candidate_mask = candidate_mask_dict[boundary_key]
+        if candidate_mask.shape != score_map.shape:
+            raise ValueError(f"candidate mask shape for {boundary_key} does not match score map shape")
+
+        valid_scores = score_map[candidate_mask]  # 只在这一侧候选区域内部看分数。
+        if valid_scores.numel() == 0:
+            continue
+        threshold = float(torch.quantile(valid_scores.to(torch.float32), q=float(box_quantile)).item())  # 取高分位阈值，尽量让 box 落在更核心的边界区域。
+        high_mask = candidate_mask & (score_map >= threshold)  # 当前有序边界的一侧高分区域。
+        if int(high_mask.sum().item()) < int(min_pixels):
+            top_count = min(int(min_pixels), int(valid_scores.numel()))  # 高分区域太少时，退化成 top-k。
+            flat_valid_indices = torch.nonzero(candidate_mask.reshape(-1), as_tuple=False).squeeze(1)
+            top_local_indices = torch.topk(valid_scores, k=top_count, largest=True).indices
+            selected_flat_indices = flat_valid_indices[top_local_indices]
+            high_mask = torch.zeros_like(candidate_mask, dtype=torch.bool)
+            high_mask.view(-1)[selected_flat_indices] = True
+
+        pair_key = tuple(sorted((int(boundary_key[0]), int(boundary_key[1]))))  # box 只服务于边界对区域，所以 pair 级 key 用无方向形式记录更方便。
+        if pair_key not in pair_region_dict:
+            pair_region_dict[pair_key] = high_mask.clone()
+            pair_meta_dict[pair_key] = {
+                "ordered_keys": [boundary_key],
+                "score_thresholds": [threshold],
+            }
+        else:
+            pair_region_dict[pair_key] = pair_region_dict[pair_key] | high_mask  # 两侧高分区域取并集，形成同一条边界对的局部 box。
+            pair_meta_dict[pair_key]["ordered_keys"].append(boundary_key)
+            pair_meta_dict[pair_key]["score_thresholds"].append(threshold)
+
+    pair_box_prompt_dict: Dict[Tuple[int, int], Dict[str, int | float | Tuple[int, int] | Tuple[BoundaryKey, ...]]] = {}
+    for pair_key, pair_mask in pair_region_dict.items():  # 每个 pair 级高分区域再转成 box。
+        coords = torch.nonzero(pair_mask, as_tuple=False)
+        if coords.numel() == 0:
+            continue
+        _, ys, xs = coords[:, 0], coords[:, 1], coords[:, 2]  # 当前脚本 batch=1，但这里还是按完整格式写，稳一点。
+        height = int(pair_mask.size(1))
+        width = int(pair_mask.size(2))
+        x1 = max(0, int(xs.min().item()) - int(padding))
+        y1 = max(0, int(ys.min().item()) - int(padding))
+        x2 = min(width - 1, int(xs.max().item()) + int(padding))
+        y2 = min(height - 1, int(ys.max().item()) + int(padding))
+        pair_box_prompt_dict[pair_key] = {
+            "box": (x1, y1, x2, y2),
+            "ordered_keys": tuple(sorted(pair_meta_dict[pair_key]["ordered_keys"])),
+            "num_pixels": int(coords.size(0)),
+            "score_threshold": float(sum(pair_meta_dict[pair_key]["score_thresholds"]) / len(pair_meta_dict[pair_key]["score_thresholds"])),
+        }
+    return pair_box_prompt_dict
 
 
 def encode_coords(coords: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -837,6 +1016,295 @@ def visualize_boundary_prototype_positions(
     plt.close(fig)  # 及时关图。
 
 
+def build_prompt_visualization_case(
+    device: torch.device,
+    se_source: Encoder,
+    seg_decoder: Decoder,
+    bank: DynamicBoundaryPrototypeBank,
+    patient_index: int,
+    slice_index: Optional[int],
+    boundary_kernel: int,
+    neighbor_kernel: int,
+    point_score_threshold: float = 0.65,
+    point_topk_per_boundary: int = 1,
+    box_quantile: float = 0.80,
+) -> Dict[str, object]:
+    """为单张 PICAI 切片构建第三步 prompt 可视化所需数据。
+
+    当前实现采用下面这套规则：
+        1. 用分割 logits 的 argmax 作为伪标签。
+        2. 用伪标签提取 ordered 边界候选区域。
+        3. 只在伪标签的 ordered 候选区域内，计算 ordered boundary prototype score。
+        4. point prompt:
+           - 对每个 ordered boundary key 保留最高分 seed。
+        5. box prompt:
+           - 对同一条边界对的两侧高分区域取并集，再生成一个 pair-level box。
+    """
+    image_batch, gt_seg_batch, image_2d, used_patient_index, used_slice_index = load_picai_source_slice(
+        patient_index=patient_index,
+        slice_index=slice_index,
+    )  # 当前切片的图像与 GT 标签先读出来。
+
+    seg_logits, feature_map = extract_pretrained_logits_and_feature_map(
+        image_batch=image_batch,
+        se_source=se_source,
+        seg_decoder=seg_decoder,
+        device=device,
+    )  # 同时提 pseudo logits 和边界特征图。
+    pseudo_label = torch.argmax(seg_logits, dim=1).to(torch.long)  # 伪标签直接用 argmax，和 teacher pseudo label 的基本形式一致。
+
+    pseudo_boundary_dict = assign_fine_boundary_labels(
+        seg_label=pseudo_label,
+        num_classes=int(seg_logits.size(1)),
+        boundary_kernel=boundary_kernel,
+        neighbor_kernel=neighbor_kernel,
+    )  # 只用伪标签做第三步，这才符合“目标域 prompt 由伪标签驱动”的设计。
+    candidate_mask_dict = build_boundary_mask_dict_from_boundary_dict(
+        boundary_dict=pseudo_boundary_dict,
+        batch_size=int(pseudo_label.size(0)),
+        height=int(pseudo_label.size(1)),
+        width=int(pseudo_label.size(2)),
+    )  # ordered boundary 候选坐标转成 mask，后面限制 score 计算区域。
+
+    score_dict = compute_all_ordered_boundary_scores(
+        feature_map=feature_map,
+        prototype_source=bank,
+        target_keys=sorted(pseudo_boundary_dict.keys()),
+        candidate_mask_dict=candidate_mask_dict,
+        fill_value=-1.0,
+    )  # 每个 ordered key 都单独算一张 score 图，(A,B) 与 (B,A) 绝不合并。
+    point_prompt_dict = extract_ordered_boundary_prompt_seeds(
+        score_dict=score_dict,
+        topk_per_boundary=point_topk_per_boundary,
+        min_score=point_score_threshold,
+    )  # point prompt 保持 ordered，每个方向独立取最高分点。
+    box_prompt_dict = build_pair_box_prompt_dict_from_score_dict(
+        score_dict=score_dict,
+        candidate_mask_dict=candidate_mask_dict,
+        box_quantile=box_quantile,
+        min_pixels=4,
+        padding=6,
+    )  # box prompt 用 pair-level 区域，便于看整条冲突边界的局部范围。
+
+    return {
+        "patient_index": int(used_patient_index),
+        "slice_index": int(used_slice_index),
+        "image_2d": image_2d,
+        "pseudo_label": pseudo_label[0].clone(),
+        "gt_label": gt_seg_batch[0].clone(),
+        "point_prompt_dict": point_prompt_dict,
+        "box_prompt_dict": box_prompt_dict,
+        "score_dict": score_dict,
+    }
+
+
+def visualize_prompt_grid(
+    case_records: List[Dict[str, object]],
+    label_key: str,
+    save_path: str | Path,
+) -> None:
+    """把多张切片的 point / box prompt 画成一个网格总览图。
+
+    输入：
+        case_records: list
+            每个元素都来自 `build_prompt_visualization_case`。
+        label_key: str
+            背景标签类型：
+            - "pseudo_label"
+            - "gt_label"
+        save_path: str | Path
+            输出图像路径。
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    if label_key not in {"pseudo_label", "gt_label"}:
+        raise ValueError("label_key must be either 'pseudo_label' or 'gt_label'")
+
+    save_path = Path(save_path).expanduser().resolve()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(case_records) == 0:
+        return
+
+    ordered_keys = sorted({
+        tuple(seed["ordered_boundary_key"])
+        for case_record in case_records
+        for seed_list in case_record["point_prompt_dict"].values()
+        for seed in seed_list
+    })  # 所有图里真正出现过的 ordered point key 先汇总出来。
+    pair_keys = sorted({
+        pair_key
+        for case_record in case_records
+        for pair_key in case_record["box_prompt_dict"].keys()
+    })  # box prompt 的 pair key 也汇总出来。
+
+    point_colors = get_boundary_colors(list(ordered_keys)) if len(ordered_keys) > 0 else {}
+    pair_colors = get_boundary_colors([tuple(pair_key) for pair_key in pair_keys]) if len(pair_keys) > 0 else {}
+
+    num_cases = len(case_records)
+    num_cols = 2 if num_cases > 1 else 1
+    num_rows = math.ceil(num_cases / num_cols)
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(7.0 * num_cols, 6.5 * num_rows))
+    axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    for axis, case_record in zip(axes, case_records):
+        label_2d = case_record[label_key]
+        label_np = label_2d.detach().cpu().numpy()
+        axis.imshow(label_np, cmap="nipy_spectral", interpolation="nearest")
+        axis.set_title(
+            f"patient={int(case_record['patient_index']):03d}, "
+            f"slice={int(case_record['slice_index']):02d}, "
+            f"background={'pseudo' if label_key == 'pseudo_label' else 'gt'}"
+        )
+        axis.axis("off")
+
+        for pair_key, box_info in sorted(case_record["box_prompt_dict"].items()):  # pair-level box 先画出来。
+            x1, y1, x2, y2 = box_info["box"]
+            rect = Rectangle(
+                (x1, y1),
+                x2 - x1 + 1,
+                y2 - y1 + 1,
+                fill=False,
+                edgecolor=pair_colors[tuple(pair_key)],
+                linewidth=2.0,
+                linestyle="-",
+                alpha=0.95,
+            )
+            axis.add_patch(rect)
+            axis.text(
+                x1,
+                max(0, y1 - 2),
+                f"box{tuple(pair_key)}",
+                color=pair_colors[tuple(pair_key)],
+                fontsize=8,
+                ha="left",
+                va="bottom",
+                bbox={"facecolor": "black", "alpha": 0.35, "pad": 1},
+            )  # box 左上角顺手写一下 pair key，便于人工核对。
+
+        for boundary_key, seed_list in sorted(case_record["point_prompt_dict"].items()):  # ordered point prompt 再画上去。
+            for seed in seed_list:
+                x = int(seed["x"])
+                y = int(seed["y"])
+                axis.scatter(
+                    x,
+                    y,
+                    s=80,
+                    c=[point_colors[boundary_key]],
+                    marker="o",
+                    edgecolors="white",
+                    linewidths=0.9,
+                    alpha=0.95,
+                )
+                axis.text(
+                    x + 1,
+                    y + 1,
+                    boundary_key_to_string(boundary_key),
+                    color=point_colors[boundary_key],
+                    fontsize=8,
+                    ha="left",
+                    va="bottom",
+                    bbox={"facecolor": "black", "alpha": 0.30, "pad": 1},
+                )  # 每个点 prompt 都直接标出 ordered key，这样一眼就能看左右方向有没有搞反。
+
+    for axis in axes[num_cases:]:
+        axis.axis("off")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_picai_pretrained_prompt_visualization(
+    save_dir: str | Path,
+    eval_patient_indices: Tuple[int, ...] = (0, 1, 2, 3),
+    eval_slice_rank: int = 0,
+    boundary_kernel: int = 5,
+    neighbor_kernel: int = 3,
+    keep_ratio: float = 0.8,
+    min_points: int = 10,
+    bank_patient_indices: Tuple[int, ...] = (0, 1, 2, 3),
+    bank_slice_ranks: Tuple[int, ...] = (0, 1),
+    point_score_threshold: float = 0.65,
+    point_topk_per_boundary: int = 1,
+    box_quantile: float = 0.80,
+) -> List[Dict[str, object]]:
+    """在多张 PICAI 切片上可视化第三步 prompt 生成结果。"""
+    save_dir = Path(save_dir).expanduser().resolve()
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    se_source, seg_decoder = load_reference_source_models(device=device)  # 继续沿用和参考训练脚本一致的权重读取方式。
+
+    bank = build_boundary_prototype_bank_from_reference_subset(
+        device=device,
+        se_source=se_source,
+        seg_decoder=seg_decoder,
+        patient_indices=bank_patient_indices,
+        slice_ranks=bank_slice_ranks,
+        boundary_kernel=boundary_kernel,
+        neighbor_kernel=neighbor_kernel,
+        keep_ratio=keep_ratio,
+        min_points=min_points,
+    )  # 先用少量源域真实切片构建 ordered boundary prototype bank。
+
+    case_records: List[Dict[str, object]] = []
+    for patient_index in eval_patient_indices:  # 多挑几张 PICAI 切片，集中看 prompt 是否合理。
+        dataset = PICAITrainDataset(
+            data_root=str(Path("/home/chenxu/dataset/picai").expanduser().resolve() / "train"),
+            modality="t2w",
+            n_slices=1,
+        )
+        slice_index = choose_slice_index_from_seg_volume(
+            dataset.data_file["seg"][int(patient_index)],
+            top_rank=eval_slice_rank,
+        )
+        case_record = build_prompt_visualization_case(
+            device=device,
+            se_source=se_source,
+            seg_decoder=seg_decoder,
+            bank=bank,
+            patient_index=int(patient_index),
+            slice_index=int(slice_index),
+            boundary_kernel=boundary_kernel,
+            neighbor_kernel=neighbor_kernel,
+            point_score_threshold=point_score_threshold,
+            point_topk_per_boundary=point_topk_per_boundary,
+            box_quantile=box_quantile,
+        )
+        case_records.append(case_record)
+
+    pseudo_prompt_path = save_dir / "picai_prompt_on_pseudo_labels.png"
+    gt_prompt_path = save_dir / "picai_prompt_on_gt_labels.png"
+    visualize_prompt_grid(case_records=case_records, label_key="pseudo_label", save_path=pseudo_prompt_path)
+    visualize_prompt_grid(case_records=case_records, label_key="gt_label", save_path=gt_prompt_path)
+
+    print("=" * 80)
+    print("PICAI Prompt Visualization")
+    print("=" * 80)
+    print(f"device={device}")
+    print(f"eval_patient_indices={eval_patient_indices}, eval_slice_rank={eval_slice_rank}")
+    print(f"boundary_kernel={boundary_kernel}, neighbor_kernel={neighbor_kernel}")
+    print(f"point_score_threshold={point_score_threshold}, point_topk_per_boundary={point_topk_per_boundary}, box_quantile={box_quantile}")
+    for case_record in case_records:
+        point_count = sum(len(seed_list) for seed_list in case_record["point_prompt_dict"].values())
+        box_count = len(case_record["box_prompt_dict"])
+        print(
+            f"patient={int(case_record['patient_index']):03d}, "
+            f"slice={int(case_record['slice_index']):02d} | "
+            f"point_prompts={point_count:2d} | "
+            f"box_prompts={box_count:2d}"
+        )
+    print("-" * 80)
+    print(f"pseudo-label prompt visualization saved to: {pseudo_prompt_path}")
+    print(f"gt-label prompt visualization saved to:     {gt_prompt_path}")
+    return case_records
+
+
 def run_picai_pretrained_boundary_visualization(
     save_dir: str | Path,
     patient_index: int = 0,
@@ -938,19 +1406,918 @@ def run_picai_pretrained_boundary_visualization(
     return summary_info
 
 
+def _prototype_exists(
+    prototype_library: DynamicBoundaryPrototypeBank | Dict[BoundaryKey, object],
+    a: int,
+    b: int,
+) -> bool:
+    """检查某个 ordered key 的 prototype 是否存在。"""
+    boundary_key = canonicalize_ordered_boundary_key(a, b)
+    if isinstance(prototype_library, DynamicBoundaryPrototypeBank):
+        return prototype_library.get(boundary_key[0], boundary_key[1]) is not None
+    if not isinstance(prototype_library, dict):
+        raise TypeError("prototype_library must be a DynamicBoundaryPrototypeBank or a dictionary")
+    if boundary_key not in prototype_library:
+        return False
+    entry = prototype_library[boundary_key]
+    if isinstance(entry, torch.Tensor):
+        return True
+    if isinstance(entry, dict):
+        return isinstance(entry.get("prototype"), torch.Tensor)
+    return False
+
+
+def build_pair_boxes_from_boundary_dict(
+    boundary_dict: BoundaryDict,
+    height: int,
+    width: int,
+    padding: int = 6,
+    require_bidirectional: bool = True,
+    prototype_library: Optional[DynamicBoundaryPrototypeBank | Dict[BoundaryKey, object]] = None,
+) -> List[Dict[str, object]]:
+    """从 ordered boundary 坐标直接构造 pair-level 局部 box。
+
+    输入：
+        boundary_dict: dict
+            `assign_fine_boundary_labels` 的输出，至少包含：
+            `{(A, B): {"coords": Tensor[N, 3], ...}}`
+        height: int
+            图像高度。
+        width: int
+            图像宽度。
+        padding: int
+            box 四周额外扩展的像素。
+        require_bidirectional: bool
+            是否要求同一对类别同时出现 `(A, B)` 与 `(B, A)`。
+        prototype_library: Optional[...]
+            若给出，则进一步要求 box 对应的两个方向 prototype 都已存在。
+
+    输出：
+        box_list: list
+            每个元素形式为：
+            {
+                "batch_idx": int,
+                "a": int,
+                "b": int,
+                "box": (x1, y1, x2, y2),
+                "ordered_keys": ((A, B), (B, A)),
+                "num_pixels": int,
+            }
+
+    说明：
+        1. 当前 helper 直接从 label 的 ordered 边界点坐标回推局部 box。
+        2. 这里不再依赖旧版第三部分的全图 score map。
+        3. 默认只保留真正具备双向 ordered 定义的 pair，这样后续才能稳定找出两个核心点。
+    """
+    pair_coord_buckets: Dict[Tuple[int, int, int], List[torch.Tensor]] = {}
+    pair_ordered_key_buckets: Dict[Tuple[int, int, int], set[BoundaryKey]] = {}
+
+    for boundary_key, boundary_data in boundary_dict.items():
+        coords = boundary_data.get("coords")
+        if not isinstance(coords, torch.Tensor):
+            raise TypeError(f"boundary_dict[{boundary_key}]['coords'] must be a torch.Tensor")
+        if coords.numel() == 0:
+            continue
+
+        coords = coords.long()
+        pair_key = tuple(sorted((int(boundary_key[0]), int(boundary_key[1]))))
+        unique_batch_indices = torch.unique(coords[:, 0])
+        for batch_idx in unique_batch_indices.tolist():
+            batch_coords = coords[coords[:, 0] == int(batch_idx)]
+            if batch_coords.numel() == 0:
+                continue
+            bucket_key = (int(batch_idx), int(pair_key[0]), int(pair_key[1]))
+            pair_coord_buckets.setdefault(bucket_key, []).append(batch_coords)
+            pair_ordered_key_buckets.setdefault(bucket_key, set()).add(
+                canonicalize_ordered_boundary_key(boundary_key[0], boundary_key[1])
+            )
+
+    box_list: List[Dict[str, object]] = []
+    for bucket_key in sorted(pair_coord_buckets.keys()):
+        batch_idx, a, b = bucket_key
+        expected_ordered_keys = {
+            canonicalize_ordered_boundary_key(a, b),
+            canonicalize_ordered_boundary_key(b, a),
+        }
+        present_ordered_keys = pair_ordered_key_buckets[bucket_key]
+        if require_bidirectional and not expected_ordered_keys.issubset(present_ordered_keys):
+            continue
+
+        if prototype_library is not None:
+            has_ab = _prototype_exists(prototype_library, a, b)
+            has_ba = _prototype_exists(prototype_library, b, a)
+            if require_bidirectional and not (has_ab and has_ba):
+                continue
+            if not require_bidirectional and not (has_ab or has_ba):
+                continue
+
+        merged_coords = torch.cat(pair_coord_buckets[bucket_key], dim=0)
+        ys = merged_coords[:, 1]
+        xs = merged_coords[:, 2]
+        x1 = max(0, int(xs.min().item()) - int(padding))
+        y1 = max(0, int(ys.min().item()) - int(padding))
+        x2 = min(int(width) - 1, int(xs.max().item()) + int(padding))
+        y2 = min(int(height) - 1, int(ys.max().item()) + int(padding))
+
+        box_list.append(
+            {
+                "batch_idx": int(batch_idx),
+                "a": int(a),
+                "b": int(b),
+                "box": (x1, y1, x2, y2),
+                "ordered_keys": tuple(sorted(expected_ordered_keys)),
+                "num_pixels": int(merged_coords.size(0)),
+            }
+        )
+
+    return box_list
+
+
+def build_ordered_core_visualization_case(
+    device: torch.device,
+    se_source: Encoder,
+    seg_decoder: Decoder,
+    bank: DynamicBoundaryPrototypeBank,
+    patient_index: int,
+    slice_index: Optional[int],
+    boundary_kernel: int,
+    neighbor_kernel: int,
+    box_padding: int = 6,
+    use_soft_uncertainty: bool = False,
+) -> Dict[str, object]:
+    """为单张 PICAI 切片构建“第三部分：box 内双向核心点”可视化数据。
+
+    当前实现明确分成两条平行路径：
+        1. pseudo-label 几何路径：
+           pseudo_label -> ordered boundary -> pair box -> core_ab / core_ba
+        2. gt-label 几何路径：
+           gt_label -> ordered boundary -> pair box -> core_ab / core_ba
+
+    这样你可以直接比较：
+        - 在伪标签几何约束下，box 和双向核心点落在哪里
+        - 在真实标签几何约束下，box 和双向核心点落在哪里
+    """
+    image_batch, gt_seg_batch, image_2d, used_patient_index, used_slice_index = load_picai_source_slice(
+        patient_index=patient_index,
+        slice_index=slice_index,
+    )
+
+    seg_logits, feature_map = extract_pretrained_logits_and_feature_map(
+        image_batch=image_batch,
+        se_source=se_source,
+        seg_decoder=seg_decoder,
+        device=device,
+    )
+    pseudo_label = torch.argmax(seg_logits, dim=1).to(torch.long)
+    prob_map = torch.softmax(seg_logits.to(torch.float32), dim=1)
+
+    pseudo_boundary_dict = assign_fine_boundary_labels(
+        seg_label=pseudo_label,
+        num_classes=int(seg_logits.size(1)),
+        boundary_kernel=boundary_kernel,
+        neighbor_kernel=neighbor_kernel,
+    )
+    gt_boundary_dict = assign_fine_boundary_labels(
+        seg_label=gt_seg_batch,
+        num_classes=int(seg_logits.size(1)),
+        boundary_kernel=boundary_kernel,
+        neighbor_kernel=neighbor_kernel,
+    )
+
+    height = int(pseudo_label.size(1))
+    width = int(pseudo_label.size(2))
+    pseudo_box_list = build_pair_boxes_from_boundary_dict(
+        boundary_dict=pseudo_boundary_dict,
+        height=height,
+        width=width,
+        padding=box_padding,
+        require_bidirectional=True,
+        prototype_library=bank,
+    )
+    gt_box_list = build_pair_boxes_from_boundary_dict(
+        boundary_dict=gt_boundary_dict,
+        height=height,
+        width=width,
+        padding=box_padding,
+        require_bidirectional=True,
+        prototype_library=bank,
+    )
+
+    pseudo_core_results = generate_ordered_core_points_for_boxes(
+        feature_map=feature_map,
+        box_list=pseudo_box_list,
+        prototype_library=bank,
+        prob_map=prob_map,
+        use_soft_uncertainty=use_soft_uncertainty,
+    )
+    gt_core_results = generate_ordered_core_points_for_boxes(
+        feature_map=feature_map,
+        box_list=gt_box_list,
+        prototype_library=bank,
+        prob_map=prob_map,
+        use_soft_uncertainty=use_soft_uncertainty,
+    )
+
+    return {
+        "patient_index": int(used_patient_index),
+        "slice_index": int(used_slice_index),
+        "image_2d": image_2d,
+        "pseudo_label": pseudo_label[0].clone(),
+        "gt_label": gt_seg_batch[0].clone(),
+        "pseudo_box_list": pseudo_box_list,
+        "gt_box_list": gt_box_list,
+        "pseudo_core_results": pseudo_core_results,
+        "gt_core_results": gt_core_results,
+    }
+
+
+def build_box_core_list_from_core_results(
+    core_result_list: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    """把第三部分的 core result 列表整理成第四部分可直接消费的输入列表。
+
+    输入：
+        core_result_list: list
+            `generate_ordered_core_points_for_boxes` 的输出列表。
+
+    输出：
+        box_core_list: list
+            每个元素至少包含：
+            - `box`
+            - `core_ab`
+            - `core_ba`
+            - `a`
+            - `b`
+
+    说明：
+        1. 当前第四部分必须同时拿到 `core_ab` 和 `core_ba`，否则就没有稳定的跨边界方向。
+        2. 所以这里只保留双向核心点都存在的 pair。
+    """
+    box_core_list: List[Dict[str, object]] = []
+    for result in core_result_list:
+        core_ab = result.get("core_ab")
+        core_ba = result.get("core_ba")
+        pair = result.get("pair")
+        box = result.get("box")
+        if not isinstance(core_ab, dict) or not isinstance(core_ba, dict):
+            continue
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            continue
+        if not isinstance(box, dict):
+            continue
+        box_core_list.append(
+            {
+                "box": box,
+                "core_ab": core_ab,
+                "core_ba": core_ba,
+                "a": int(pair[0]),
+                "b": int(pair[1]),
+            }
+        )
+    return box_core_list
+
+
+def build_ordered_point_prompt_visualization_case(
+    device: torch.device,
+    se_source: Encoder,
+    seg_decoder: Decoder,
+    bank: DynamicBoundaryPrototypeBank,
+    patient_index: int,
+    slice_index: Optional[int],
+    boundary_kernel: int,
+    neighbor_kernel: int,
+    box_padding: int = 6,
+    use_soft_uncertainty: bool = False,
+    offset_distance: float = 3.0,
+    window_radius: int = 12,
+    sigma: float = 5.0,
+    topk_per_side: int = 3,
+    min_distance: float = 5.0,
+    min_score: Optional[float] = None,
+) -> Dict[str, object]:
+    """为单张 PICAI 切片构建“第三部分 + 第四部分”联合可视化数据。
+
+    当前实现流程：
+        1. 先走第三部分：
+           pseudo/gt label -> pair box -> core_ab/core_ba
+        2. 再接第四部分：
+           core_ab/core_ba -> direction -> ref centers -> points_a/points_b
+
+    这样你可以直接看：
+        - 伪标签几何下的双向核心点和多点 prompt 分布
+        - 真实标签几何下的双向核心点和多点 prompt 分布
+    """
+    case_record = build_ordered_core_visualization_case(
+        device=device,
+        se_source=se_source,
+        seg_decoder=seg_decoder,
+        bank=bank,
+        patient_index=patient_index,
+        slice_index=slice_index,
+        boundary_kernel=boundary_kernel,
+        neighbor_kernel=neighbor_kernel,
+        box_padding=box_padding,
+        use_soft_uncertainty=use_soft_uncertainty,
+    )
+
+    image_batch, _, _, _, _ = load_picai_source_slice(
+        patient_index=int(case_record["patient_index"]),
+        slice_index=int(case_record["slice_index"]),
+    )
+    seg_logits, _ = extract_pretrained_logits_and_feature_map(
+        image_batch=image_batch,
+        se_source=se_source,
+        seg_decoder=seg_decoder,
+        device=device,
+    )
+    prob_map = torch.softmax(seg_logits.to(torch.float32), dim=1)
+
+    pseudo_box_core_list = build_box_core_list_from_core_results(case_record["pseudo_core_results"])
+    gt_box_core_list = build_box_core_list_from_core_results(case_record["gt_core_results"])
+
+    pseudo_point_prompt_results = generate_point_prompts_for_box_list(
+        prob_map=prob_map,
+        box_core_list=pseudo_box_core_list,
+        offset_distance=offset_distance,
+        window_radius=window_radius,
+        sigma=sigma,
+        topk_per_side=topk_per_side,
+        min_distance=min_distance,
+        min_score=min_score,
+    )
+    gt_point_prompt_results = generate_point_prompts_for_box_list(
+        prob_map=prob_map,
+        box_core_list=gt_box_core_list,
+        offset_distance=offset_distance,
+        window_radius=window_radius,
+        sigma=sigma,
+        topk_per_side=topk_per_side,
+        min_distance=min_distance,
+        min_score=min_score,
+    )
+
+    case_record["pseudo_point_prompt_results"] = pseudo_point_prompt_results
+    case_record["gt_point_prompt_results"] = gt_point_prompt_results
+    return case_record
+
+
+def visualize_ordered_core_grid(
+    case_records: List[Dict[str, object]],
+    label_key: str,
+    result_key: str,
+    save_path: str | Path,
+) -> None:
+    """把多张切片的 ordered core point 几何分布画成网格图。
+
+    输入：
+        case_records: list
+            每个元素都来自 `build_ordered_core_visualization_case`。
+        label_key: str
+            背景标签类型：
+            - `pseudo_label`
+            - `gt_label`
+        result_key: str
+            当前要显示的核心点结果：
+            - `pseudo_core_results`
+            - `gt_core_results`
+        save_path: str | Path
+            输出图像路径。
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    if label_key not in {"pseudo_label", "gt_label"}:
+        raise ValueError("label_key must be either 'pseudo_label' or 'gt_label'")
+    if result_key not in {"pseudo_core_results", "gt_core_results"}:
+        raise ValueError("result_key must be either 'pseudo_core_results' or 'gt_core_results'")
+
+    save_path = Path(save_path).expanduser().resolve()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(case_records) == 0:
+        return
+
+    pair_keys = sorted({
+        tuple(result["pair"])
+        for case_record in case_records
+        for result in case_record[result_key]
+    })
+    pair_colors = get_boundary_colors([tuple(pair_key) for pair_key in pair_keys]) if len(pair_keys) > 0 else {}
+
+    num_cases = len(case_records)
+    num_cols = 2 if num_cases > 1 else 1
+    num_rows = math.ceil(num_cases / num_cols)
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(7.2 * num_cols, 6.8 * num_rows))
+    axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    for axis, case_record in zip(axes, case_records):
+        label_2d = case_record[label_key]
+        label_np = label_2d.detach().cpu().numpy()
+        axis.imshow(label_np, cmap="nipy_spectral", interpolation="nearest")
+        axis.set_title(
+            f"patient={int(case_record['patient_index']):03d}, "
+            f"slice={int(case_record['slice_index']):02d}, "
+            f"geometry={'pseudo' if result_key == 'pseudo_core_results' else 'gt'}"
+        )
+        axis.axis("off")
+
+        for result in case_record[result_key]:
+            pair = tuple(result["pair"])
+            box_info = result["box"]
+            x1, y1, x2, y2 = box_info["x1"], box_info["y1"], box_info["x2"], box_info["y2"]
+            box_color = pair_colors.get(pair, (1.0, 1.0, 0.0, 1.0))
+
+            rect = Rectangle(
+                (x1, y1),
+                x2 - x1 + 1,
+                y2 - y1 + 1,
+                fill=False,
+                edgecolor=box_color,
+                linewidth=2.0,
+                linestyle="-",
+                alpha=0.95,
+            )
+            axis.add_patch(rect)
+            axis.text(
+                x1,
+                max(0, y1 - 2),
+                f"pair{pair}",
+                color=box_color,
+                fontsize=8,
+                ha="left",
+                va="bottom",
+                bbox={"facecolor": "black", "alpha": 0.35, "pad": 1},
+            )
+
+            core_ab = result["core_ab"]
+            core_ba = result["core_ba"]
+            if isinstance(core_ab, dict):
+                axis.scatter(
+                    int(core_ab["x"]),
+                    int(core_ab["y"]),
+                    s=80,
+                    c="red",
+                    marker="o",
+                    edgecolors="white",
+                    linewidths=0.9,
+                    alpha=0.95,
+                )
+                axis.text(
+                    int(core_ab["x"]) + 1,
+                    int(core_ab["y"]) + 1,
+                    f"{pair[0]}->{pair[1]}",
+                    color="red",
+                    fontsize=8,
+                    ha="left",
+                    va="bottom",
+                    bbox={"facecolor": "white", "alpha": 0.55, "pad": 1},
+                )
+            if isinstance(core_ba, dict):
+                axis.scatter(
+                    int(core_ba["x"]),
+                    int(core_ba["y"]),
+                    s=95,
+                    c="cyan",
+                    marker="x",
+                    linewidths=2.0,
+                    alpha=0.95,
+                )
+                axis.text(
+                    int(core_ba["x"]) + 1,
+                    int(core_ba["y"]) - 1,
+                    f"{pair[1]}->{pair[0]}",
+                    color="cyan",
+                    fontsize=8,
+                    ha="left",
+                    va="top",
+                    bbox={"facecolor": "black", "alpha": 0.35, "pad": 1},
+                )
+
+    for axis in axes[num_cases:]:
+        axis.axis("off")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def visualize_point_prompt_grid(
+    case_records: List[Dict[str, object]],
+    label_key: str,
+    result_key: str,
+    save_path: str | Path,
+) -> None:
+    """把多张切片的第四部分 point prompts 画成一个网格总览图。
+
+    输入：
+        case_records: list
+            每个元素都来自 `build_ordered_point_prompt_visualization_case`。
+        label_key: str
+            背景标签类型：
+            - `pseudo_label`
+            - `gt_label`
+        result_key: str
+            当前要显示的第四部分结果：
+            - `pseudo_point_prompt_results`
+            - `gt_point_prompt_results`
+        save_path: str | Path
+            输出图像路径。
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    if label_key not in {"pseudo_label", "gt_label"}:
+        raise ValueError("label_key must be either 'pseudo_label' or 'gt_label'")
+    if result_key not in {"pseudo_point_prompt_results", "gt_point_prompt_results"}:
+        raise ValueError("result_key must be either 'pseudo_point_prompt_results' or 'gt_point_prompt_results'")
+
+    save_path = Path(save_path).expanduser().resolve()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if len(case_records) == 0:
+        return
+
+    pair_keys = sorted({
+        (int(result["a"]), int(result["b"]))
+        for case_record in case_records
+        for result in case_record[result_key]
+    })
+    pair_colors = get_boundary_colors([tuple(pair_key) for pair_key in pair_keys]) if len(pair_keys) > 0 else {}
+
+    num_cases = len(case_records)
+    num_cols = 2 if num_cases > 1 else 1
+    num_rows = math.ceil(num_cases / num_cols)
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(7.6 * num_cols, 7.0 * num_rows))
+    axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    for axis, case_record in zip(axes, case_records):
+        label_2d = case_record[label_key]
+        label_np = label_2d.detach().cpu().numpy()
+        axis.imshow(label_np, cmap="nipy_spectral", interpolation="nearest")
+        axis.set_title(
+            f"patient={int(case_record['patient_index']):03d}, "
+            f"slice={int(case_record['slice_index']):02d}, "
+            f"geometry={'pseudo' if result_key == 'pseudo_point_prompt_results' else 'gt'}"
+        )
+        axis.axis("off")
+
+        for result in case_record[result_key]:
+            a = int(result["a"])
+            b = int(result["b"])
+            pair = (a, b)
+            box_info = result["box"]
+            x_min = int(box_info["x_min"])
+            y_min = int(box_info["y_min"])
+            x_max = int(box_info["x_max"])
+            y_max = int(box_info["y_max"])
+            pair_color = pair_colors.get(pair, (1.0, 1.0, 0.0, 1.0))
+
+            rect = Rectangle(
+                (x_min, y_min),
+                x_max - x_min + 1,
+                y_max - y_min + 1,
+                fill=False,
+                edgecolor=pair_color,
+                linewidth=2.0,
+                linestyle="-",
+                alpha=0.95,
+            )
+            axis.add_patch(rect)
+            axis.text(
+                x_min,
+                max(0, y_min - 2),
+                f"pair{pair}",
+                color=pair_color,
+                fontsize=8,
+                ha="left",
+                va="bottom",
+                bbox={"facecolor": "black", "alpha": 0.35, "pad": 1},
+            )
+
+            core_ab = result["core_ab"]
+            core_ba = result["core_ba"]
+            if isinstance(core_ab, dict):
+                axis.scatter(
+                    int(core_ab["x"]),
+                    int(core_ab["y"]),
+                    s=110,
+                    c="red",
+                    marker="*",
+                    edgecolors="white",
+                    linewidths=0.8,
+                    alpha=0.95,
+                )
+            if isinstance(core_ba, dict):
+                axis.scatter(
+                    int(core_ba["x"]),
+                    int(core_ba["y"]),
+                    s=110,
+                    c="cyan",
+                    marker="*",
+                    edgecolors="black",
+                    linewidths=0.8,
+                    alpha=0.95,
+                )
+
+            ref_center_a = result["ref_center_a"]
+            ref_center_b = result["ref_center_b"]
+            axis.scatter(
+                [float(ref_center_a["x"])],
+                [float(ref_center_a["y"])],
+                s=85,
+                facecolors="none",
+                edgecolors="orange",
+                linewidths=2.0,
+                marker="o",
+            )
+            axis.scatter(
+                [float(ref_center_b["x"])],
+                [float(ref_center_b["y"])],
+                s=85,
+                c="lime",
+                linewidths=2.0,
+                marker="x",
+            )
+
+            for point in result["points_a"]:
+                axis.scatter(
+                    int(point["x"]),
+                    int(point["y"]),
+                    s=72,
+                    c="orange",
+                    marker="o",
+                    edgecolors="black",
+                    linewidths=0.6,
+                    alpha=0.95,
+                )
+            for point in result["points_b"]:
+                axis.scatter(
+                    int(point["x"]),
+                    int(point["y"]),
+                    s=72,
+                    c="lime",
+                    marker="x",
+                    linewidths=2.0,
+                    alpha=0.95,
+                )
+
+    for axis in axes[num_cases:]:
+        axis.axis("off")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_picai_pretrained_ordered_core_visualization(
+    save_dir: str | Path,
+    eval_patient_indices: Tuple[int, ...] = (0, 1, 2, 3),
+    eval_slice_rank: int = 0,
+    boundary_kernel: int = 5,
+    neighbor_kernel: int = 3,
+    keep_ratio: float = 0.8,
+    min_points: int = 10,
+    bank_patient_indices: Tuple[int, ...] = (0, 1, 2, 3),
+    bank_slice_ranks: Tuple[int, ...] = (0, 1),
+    box_padding: int = 6,
+    use_soft_uncertainty: bool = False,
+) -> List[Dict[str, object]]:
+    """在 PICAI 上可视化第三部分的 box 内双向 ordered core points。"""
+    save_dir = Path(save_dir).expanduser().resolve()
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    se_source, seg_decoder = load_reference_source_models(device=device)
+
+    bank = build_boundary_prototype_bank_from_reference_subset(
+        device=device,
+        se_source=se_source,
+        seg_decoder=seg_decoder,
+        patient_indices=bank_patient_indices,
+        slice_ranks=bank_slice_ranks,
+        boundary_kernel=boundary_kernel,
+        neighbor_kernel=neighbor_kernel,
+        keep_ratio=keep_ratio,
+        min_points=min_points,
+    )
+
+    case_records: List[Dict[str, object]] = []
+    for patient_index in eval_patient_indices:
+        dataset = PICAITrainDataset(
+            data_root=str(Path("/home/chenxu/dataset/picai").expanduser().resolve() / "train"),
+            modality="t2w",
+            n_slices=1,
+        )
+        slice_index = choose_slice_index_from_seg_volume(
+            dataset.data_file["seg"][int(patient_index)],
+            top_rank=eval_slice_rank,
+        )
+        case_record = build_ordered_core_visualization_case(
+            device=device,
+            se_source=se_source,
+            seg_decoder=seg_decoder,
+            bank=bank,
+            patient_index=int(patient_index),
+            slice_index=int(slice_index),
+            boundary_kernel=boundary_kernel,
+            neighbor_kernel=neighbor_kernel,
+            box_padding=box_padding,
+            use_soft_uncertainty=use_soft_uncertainty,
+        )
+        case_records.append(case_record)
+
+    pseudo_path = save_dir / "picai_ordered_core_points_on_pseudo_labels.png"
+    gt_path = save_dir / "picai_ordered_core_points_on_gt_labels.png"
+    visualize_ordered_core_grid(
+        case_records=case_records,
+        label_key="pseudo_label",
+        result_key="pseudo_core_results",
+        save_path=pseudo_path,
+    )
+    visualize_ordered_core_grid(
+        case_records=case_records,
+        label_key="gt_label",
+        result_key="gt_core_results",
+        save_path=gt_path,
+    )
+
+    print("=" * 80)
+    print("PICAI Ordered Core Point Visualization")
+    print("=" * 80)
+    print(f"device={device}")
+    print(f"eval_patient_indices={eval_patient_indices}, eval_slice_rank={eval_slice_rank}")
+    print(f"boundary_kernel={boundary_kernel}, neighbor_kernel={neighbor_kernel}, box_padding={box_padding}")
+    print(f"use_soft_uncertainty={use_soft_uncertainty}")
+    for case_record in case_records:
+        pseudo_results = case_record["pseudo_core_results"]
+        gt_results = case_record["gt_core_results"]
+        print(
+            f"patient={int(case_record['patient_index']):03d}, "
+            f"slice={int(case_record['slice_index']):02d} | "
+            f"pseudo_pairs={len(pseudo_results):2d} | "
+            f"gt_pairs={len(gt_results):2d}"
+        )
+        for result_name, result_list in (("pseudo", pseudo_results), ("gt", gt_results)):
+            for result in result_list:
+                print(
+                    f"  {result_name:>6s} pair={tuple(result['pair'])} | "
+                    f"core_ab={result['core_ab']} | "
+                    f"core_ba={result['core_ba']}"
+                )
+    print("-" * 80)
+    print(f"pseudo-label core visualization saved to: {pseudo_path}")
+    print(f"gt-label core visualization saved to:     {gt_path}")
+    return case_records
+
+
+def run_picai_pretrained_point_prompt_visualization(
+    save_dir: str | Path,
+    eval_patient_indices: Tuple[int, ...] = (0, 1, 2, 3),
+    eval_slice_rank: int = 0,
+    boundary_kernel: int = 5,
+    neighbor_kernel: int = 3,
+    keep_ratio: float = 0.8,
+    min_points: int = 10,
+    bank_patient_indices: Tuple[int, ...] = (0, 1, 2, 3),
+    bank_slice_ranks: Tuple[int, ...] = (0, 1),
+    box_padding: int = 6,
+    use_soft_uncertainty: bool = False,
+    offset_distance: float = 3.0,
+    window_radius: int = 12,
+    sigma: float = 5.0,
+    topk_per_side: int = 3,
+    min_distance: float = 5.0,
+    min_score: Optional[float] = None,
+) -> List[Dict[str, object]]:
+    """在 PICAI 上可视化“第三部分核心点 -> 第四部分多点 prompts”的完整几何链路。"""
+    save_dir = Path(save_dir).expanduser().resolve()
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    se_source, seg_decoder = load_reference_source_models(device=device)
+
+    bank = build_boundary_prototype_bank_from_reference_subset(
+        device=device,
+        se_source=se_source,
+        seg_decoder=seg_decoder,
+        patient_indices=bank_patient_indices,
+        slice_ranks=bank_slice_ranks,
+        boundary_kernel=boundary_kernel,
+        neighbor_kernel=neighbor_kernel,
+        keep_ratio=keep_ratio,
+        min_points=min_points,
+    )
+
+    case_records: List[Dict[str, object]] = []
+    for patient_index in eval_patient_indices:
+        dataset = PICAITrainDataset(
+            data_root=str(Path("/home/chenxu/dataset/picai").expanduser().resolve() / "train"),
+            modality="t2w",
+            n_slices=1,
+        )
+        slice_index = choose_slice_index_from_seg_volume(
+            dataset.data_file["seg"][int(patient_index)],
+            top_rank=eval_slice_rank,
+        )
+        case_record = build_ordered_point_prompt_visualization_case(
+            device=device,
+            se_source=se_source,
+            seg_decoder=seg_decoder,
+            bank=bank,
+            patient_index=int(patient_index),
+            slice_index=int(slice_index),
+            boundary_kernel=boundary_kernel,
+            neighbor_kernel=neighbor_kernel,
+            box_padding=box_padding,
+            use_soft_uncertainty=use_soft_uncertainty,
+            offset_distance=offset_distance,
+            window_radius=window_radius,
+            sigma=sigma,
+            topk_per_side=topk_per_side,
+            min_distance=min_distance,
+            min_score=min_score,
+        )
+        case_records.append(case_record)
+
+    pseudo_path = save_dir / "picai_point_prompts_on_pseudo_labels.png"
+    gt_path = save_dir / "picai_point_prompts_on_gt_labels.png"
+    visualize_point_prompt_grid(
+        case_records=case_records,
+        label_key="pseudo_label",
+        result_key="pseudo_point_prompt_results",
+        save_path=pseudo_path,
+    )
+    visualize_point_prompt_grid(
+        case_records=case_records,
+        label_key="gt_label",
+        result_key="gt_point_prompt_results",
+        save_path=gt_path,
+    )
+
+    print("=" * 80)
+    print("PICAI Ordered Core -> Point Prompt Visualization")
+    print("=" * 80)
+    print(f"device={device}")
+    print(f"eval_patient_indices={eval_patient_indices}, eval_slice_rank={eval_slice_rank}")
+    print(
+        f"boundary_kernel={boundary_kernel}, neighbor_kernel={neighbor_kernel}, "
+        f"box_padding={box_padding}, offset_distance={offset_distance}, window_radius={window_radius}"
+    )
+    print(
+        f"sigma={sigma}, topk_per_side={topk_per_side}, min_distance={min_distance}, "
+        f"min_score={min_score}, use_soft_uncertainty={use_soft_uncertainty}"
+    )
+    for case_record in case_records:
+        pseudo_results = case_record["pseudo_point_prompt_results"]
+        gt_results = case_record["gt_point_prompt_results"]
+        print(
+            f"patient={int(case_record['patient_index']):03d}, "
+            f"slice={int(case_record['slice_index']):02d} | "
+            f"pseudo_pairs={len(pseudo_results):2d} | "
+            f"gt_pairs={len(gt_results):2d}"
+        )
+        for result_name, result_list in (("pseudo", pseudo_results), ("gt", gt_results)):
+            for result in result_list:
+                print(
+                    f"  {result_name:>6s} pair=({int(result['a'])},{int(result['b'])}) | "
+                    f"ref_a=({float(result['ref_center_a']['y']):.1f},{float(result['ref_center_a']['x']):.1f}) | "
+                    f"ref_b=({float(result['ref_center_b']['y']):.1f},{float(result['ref_center_b']['x']):.1f}) | "
+                    f"points_a={len(result['points_a'])} | "
+                    f"points_b={len(result['points_b'])}"
+                )
+    print("-" * 80)
+    print(f"pseudo-label point-prompt visualization saved to: {pseudo_path}")
+    print(f"gt-label point-prompt visualization saved to:     {gt_path}")
+    return case_records
+
+
 def main() -> None:
-    """PICAI 预训练特征 + 动态原型可视化入口。"""
-    run_picai_pretrained_boundary_visualization(
+    """PICAI 预训练特征下的第三部分到第四部分联合可视化入口。"""
+    run_picai_pretrained_point_prompt_visualization(
         save_dir=Path(__file__).resolve().parent / "outputs",
-        patient_index=0,
-        slice_index=None,
+        eval_patient_indices=(0, 1, 2, 3),
+        eval_slice_rank=0,
         boundary_kernel=5,
         neighbor_kernel=3,
         keep_ratio=0.8,
         min_points=10,
         bank_patient_indices=(0, 1, 2, 3),
         bank_slice_ranks=(0, 1),
-    )  # 默认先用少量真实 PICAI 切片构一个 EMA bank，再看当前切片的原型位置。
+        box_padding=6,
+        use_soft_uncertainty=False,
+        offset_distance=3.0,
+        window_radius=12,
+        sigma=5.0,
+        topk_per_side=3,
+        min_distance=5.0,
+        min_score=None,
+    )  # 默认先在几张真实 PICAI 切片上看 pseudo/gt 两张核心点几何总览图。
 
 
 if __name__ == "__main__":  # 让脚本可直接执行。
