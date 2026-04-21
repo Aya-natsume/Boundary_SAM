@@ -815,9 +815,24 @@ def construct_strip_box_from_cutoffs(
            并用 `strip_tangent_padding / min / max` 做稳定裁剪。
     """
     box_info = _parse_box(box)
-    center_tensor = torch.tensor([float(center_point["y"]), float(center_point["x"])], dtype=torch.float32)
-    q_a_tensor = torch.tensor([float(q_a["y"]), float(q_a["x"])], dtype=torch.float32)
-    q_b_tensor = torch.tensor([float(q_b["y"]), float(q_b["x"])], dtype=torch.float32)
+    # 条带框几何必须和当前局部特征/响应留在同一设备上；
+    # 这里如果退回 CPU，后面第四步把 GPU 响应图和 CPU mask 拼起来时就会直接报 device mismatch。
+    geometry_device = tangent_vector.device
+    center_tensor = torch.tensor(
+        [float(center_point["y"]), float(center_point["x"])],
+        dtype=torch.float32,
+        device=geometry_device,
+    )
+    q_a_tensor = torch.tensor(
+        [float(q_a["y"]), float(q_a["x"])],
+        dtype=torch.float32,
+        device=geometry_device,
+    )
+    q_b_tensor = torch.tensor(
+        [float(q_b["y"]), float(q_b["x"])],
+        dtype=torch.float32,
+        device=geometry_device,
+    )
 
     # `q_a / q_b` 只定义法线方向上的两条边界线；
     # 最终条带框仍然要回到“中心 + 切线半长 + 法线半宽”的参数化表示，第四步才好分段。
@@ -883,12 +898,19 @@ def construct_strip_box_from_cutoffs(
 def _build_strip_coordinate_maps(strip_box: Dict[str, object]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """在条带框的 axis-aligned bbox 内构造切线坐标图、法线坐标图和条带 mask。"""
     h_box, w_box = _get_box_size(_parse_box(strip_box))
-    y_coords = torch.arange(h_box, dtype=torch.float32).unsqueeze(1).repeat(1, w_box) + float(strip_box["y_min"])
-    x_coords = torch.arange(w_box, dtype=torch.float32).unsqueeze(0).repeat(h_box, 1) + float(strip_box["x_min"])
-    relative_y = y_coords - float(strip_box["strip_center_y"])
-    relative_x = x_coords - float(strip_box["strip_center_x"])
     tangent_vector = torch.as_tensor(strip_box["tangent_vector"], dtype=torch.float32)
     normal_vector = torch.as_tensor(strip_box["normal_vector"], dtype=torch.float32)
+    geometry_device = tangent_vector.device
+    y_coords = (
+        torch.arange(h_box, dtype=torch.float32, device=geometry_device).unsqueeze(1).repeat(1, w_box)
+        + float(strip_box["y_min"])
+    )
+    x_coords = (
+        torch.arange(w_box, dtype=torch.float32, device=geometry_device).unsqueeze(0).repeat(h_box, 1)
+        + float(strip_box["x_min"])
+    )
+    relative_y = y_coords - float(strip_box["strip_center_y"])
+    relative_x = x_coords - float(strip_box["strip_center_x"])
 
     tangent_coord = relative_y * float(tangent_vector[0].item()) + relative_x * float(tangent_vector[1].item())
     normal_coord = relative_y * float(normal_vector[0].item()) + relative_x * float(normal_vector[1].item())

@@ -148,14 +148,24 @@ def _extract_required_strip_data(box: BoxDict) -> Dict[str, object]:
     missing_meta = [key for key in required_meta_keys if key not in box]
     if missing_meta:
         raise KeyError(f"box is missing required strip geometry fields: {missing_meta}")
+    response_device = None
+    for tensor_key in required_tensor_keys:
+        tensor_value = box[tensor_key]
+        if isinstance(tensor_value, torch.Tensor):
+            response_device = tensor_value.device
+            break
+    if response_device is None:
+        response_device = torch.device("cpu")
     return {
-        "response_a_box": torch.as_tensor(box["response_a_box"], dtype=torch.float32),
-        "response_b_box": torch.as_tensor(box["response_b_box"], dtype=torch.float32),
-        "tangent_coord_box": torch.as_tensor(box["tangent_coord_box"], dtype=torch.float32),
-        "normal_coord_box": torch.as_tensor(box["normal_coord_box"], dtype=torch.float32),
-        "strip_mask_box": torch.as_tensor(box["strip_mask_box"]).bool(),
-        "tangent_vector": torch.as_tensor(box["tangent_vector"], dtype=torch.float32),
-        "normal_vector": torch.as_tensor(box["normal_vector"], dtype=torch.float32),
+        # 第四步的响应图、坐标图和条带 mask 必须共享同一 device；
+        # 否则一旦做逐像素布尔运算或分数屏蔽，就会立刻触发 CPU/CUDA 混用报错。
+        "response_a_box": torch.as_tensor(box["response_a_box"], dtype=torch.float32, device=response_device),
+        "response_b_box": torch.as_tensor(box["response_b_box"], dtype=torch.float32, device=response_device),
+        "tangent_coord_box": torch.as_tensor(box["tangent_coord_box"], dtype=torch.float32, device=response_device),
+        "normal_coord_box": torch.as_tensor(box["normal_coord_box"], dtype=torch.float32, device=response_device),
+        "strip_mask_box": torch.as_tensor(box["strip_mask_box"], device=response_device).bool(),
+        "tangent_vector": torch.as_tensor(box["tangent_vector"], dtype=torch.float32, device=response_device),
+        "normal_vector": torch.as_tensor(box["normal_vector"], dtype=torch.float32, device=response_device),
         "strip_center_y": float(box["strip_center_y"]),
         "strip_center_x": float(box["strip_center_x"]),
         "strip_half_length": float(box["strip_half_length"]),
@@ -194,7 +204,13 @@ def split_strip_box_along_tangent(box: BoxDict, num_segments: int) -> List[Dict[
 
     # 分段只沿切线方向做，法线厚度保持整段共享；
     # 这正是新版第四步和旧版“二维 top-k 取点”最本质的差别。
-    edges = torch.linspace(-half_length, half_length, steps=int(num_segments) + 1, dtype=torch.float32)
+    edges = torch.linspace(
+        -half_length,
+        half_length,
+        steps=int(num_segments) + 1,
+        dtype=torch.float32,
+        device=tangent_coord_box.device,
+    )
     segment_list: List[Dict[str, object]] = []
     for segment_index in range(int(num_segments)):
         t_min = float(edges[segment_index].item())
