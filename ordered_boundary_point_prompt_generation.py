@@ -273,7 +273,7 @@ def select_best_prompt_in_strip_segment(
 
     valid_mask = segment_mask & side_mask
     if not bool(valid_mask.any()):
-        # 若严格排除中心线后这一段完全没点，就退一步允许这一侧整半带都参与竞争。
+
         if side_name == "a":
             valid_mask = segment_mask & (normal_coord_box <= 0.0)
         else:
@@ -457,7 +457,7 @@ def generate_point_prompts_from_ordered_cores(
         "segment_regions": segments,
         "points_a": points_a,
         "points_b": points_b,
-        # 兼容旧版调用字段名，虽然新版已经不是 window，而是整个条带 bbox。
+
         "window_a": box,
         "window_b": box,
         "score_map_a_window": response_a_box,

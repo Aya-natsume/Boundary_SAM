@@ -81,7 +81,7 @@ def export_single_pair_debug_views(save_dir: str | Path) -> None:
                     f"_slice_{int(case_record['slice_index']):02d}"
                     f"_pair_{a}_{b}_{geometry_name}.png"
                 )
-                # 这里直接复用第四部分自带的详细调试图，把中心点、法线、锚点和分层点全部画出来。
+
                 visualize_point_prompts_in_box(
                     image_or_mask_2d=background_2d,
                     box=result["box"],

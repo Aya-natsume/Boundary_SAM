@@ -427,10 +427,13 @@ def extract_local_boundary_points_near_center(
         boundary_info: dict
             {
                 "boundary_response_box": Tensor[h_box, w_box],
-                "boundary_points_global": Tensor[N, 2],   # `(y, x)`
-                "boundary_points_local": Tensor[N, 2],    # `(y_local, x_local)`
+                "boundary_points_global": Tensor[N, 2],
+                "boundary_points_local": Tensor[N, 2],
                 "boundary_scores": Tensor[N],
             }
+            其中：
+            - `boundary_points_global` 的坐标顺序是 `(y, x)`
+            - `boundary_points_local` 的坐标顺序是 `(y_local, x_local)`
     """
     fit_radius = float(DEFAULT_STRIP_BOX_CONFIG["local_fit_radius"]) if fit_radius is None else float(fit_radius)
     topk_points = int(DEFAULT_STRIP_BOX_CONFIG["local_fit_topk"]) if topk_points is None else int(topk_points)
@@ -468,7 +471,7 @@ def extract_local_boundary_points_near_center(
         distances = distances[near_mask]
 
     if candidate_coords_global.size(0) > topk_points:
-        # 这里优先保留“离中心近且边界响应高”的那批点，避免拟合被远处噪声拖偏。
+
         ranking_score = candidate_scores - 0.03 * distances.to(candidate_scores.device)
         keep_indices = torch.topk(ranking_score, k=topk_points, largest=True).indices
         candidate_coords_global = candidate_coords_global[keep_indices]
@@ -569,7 +572,7 @@ def estimate_local_tangent_and_normal(
     tangent = eigen_vectors[:, int(torch.argmax(eigen_values).item())]
     tangent = tangent / tangent.norm(p=2).clamp_min(1e-6)
 
-    # `(dy, dx)` 的法线只需要取一个正交向量即可，后面再用 ordered prototype 去定方向。
+
     normal = torch.tensor([float(tangent[1].item()), -float(tangent[0].item())], dtype=torch.float32, device=tangent.device)
     normal = normal / normal.norm(p=2).clamp_min(1e-6)
 
@@ -648,10 +651,14 @@ def sample_points_along_normal(
     输出：
         sample_dict: dict
             {
-                "points": Tensor[N, 2],        # 全局 `(y, x)`
-                "distances": Tensor[N],        # 距离中心点的标量距离
-                "direction": Tensor[2],        # 当前一侧实际使用的方向
+                "points": Tensor[N, 2],
+                "distances": Tensor[N],
+                "direction": Tensor[2],
             }
+            其中：
+            - `points` 的坐标顺序是全局 `(y, x)`
+            - `distances` 表示点到中心点的标量距离
+            - `direction` 是当前一侧实际使用的法线方向
     """
     if side_name not in {"a", "b"}:
         raise ValueError("side_name must be either 'a' or 'b'")
@@ -832,7 +839,7 @@ def construct_strip_box_from_cutoffs(
         "tangent_vector": tangent_vector.detach().clone(),
         "normal_vector": normal_vector.detach().clone(),
         "strip_polygon": strip_polygon.detach().clone(),
-        # 兼容旧可视化/调试路径，中心点也直接挂在 box 里，后面第四步只拿 box 也能继续走。
+
         "center_point": {
             "batch_idx": int(box_info["batch_idx"]),
             "y": float(center_tensor[0].item()),
@@ -968,9 +975,9 @@ def generate_ordered_core_points_in_box(
             主要字段包括：
             {
                 "pair": (a, b),
-                "box": {...},                     # 最终条带框的 axis-aligned bbox + 几何元信息
-                "core_ab": {...},                 # 兼容字段，别名到 q_a
-                "core_ba": {...},                 # 兼容字段，别名到 q_b
+                "box": {...},
+                "core_ab": {...},
+                "core_ba": {...},
                 "center_point": {...},
                 "tangent_vector": Tensor[2],
                 "normal_vector": Tensor[2],
@@ -992,6 +999,9 @@ def generate_ordered_core_points_in_box(
                 "normal_coord_box": Tensor[h_strip, w_strip],
                 "strip_mask_box": Tensor[h_strip, w_strip],
             }
+            其中：
+            - `box` 保存最终条带框的轴对齐 bbox 与几何元信息
+            - `core_ab` 与 `core_ba` 是兼容旧接口的字段，分别别名到 `q_a` 与 `q_b`
     """
     if prob_map is None:
         raise ValueError("prob_map must be provided in the new step-three pipeline")
@@ -1100,8 +1110,8 @@ def generate_ordered_core_points_in_box(
     strip_box["tangent_coord_box"] = tangent_coord_box
     strip_box["normal_coord_box"] = normal_coord_box
     strip_box["strip_mask_box"] = strip_mask_box
-    # 这里把第三步几何调试所需的一维采样与曲线也直接挂进 box，
-    # 这样第四步即使只拿到 `box`，仍然能把整条链路完整可视化出来。
+
+
     strip_box["boundary_points_global"] = boundary_info["boundary_points_global"]
     strip_box["normal_samples_a"] = samples_a
     strip_box["normal_samples_b"] = samples_b
@@ -1377,7 +1387,7 @@ def _build_demo_inputs() -> Tuple[torch.Tensor, torch.Tensor, Dict[BoundaryKey, 
     y_coords = torch.arange(height, dtype=torch.float32).unsqueeze(1).repeat(1, width)
     x_coords = torch.arange(width, dtype=torch.float32).unsqueeze(0).repeat(height, 1)
 
-    # 这里用一条竖向边界做 toy example：左侧更像 A，右侧更像 B，中间是一条粗边界带。
+
     center_x = 36.0
     distance_x = x_coords - center_x
     prob_a = torch.sigmoid(-distance_x / 2.6)
