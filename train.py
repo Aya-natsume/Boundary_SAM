@@ -43,6 +43,15 @@ from source_fine_boundary_points import (
 
 BoundaryKey = Tuple[int, int]
 PromptResult = Dict[str, object]
+DEFAULT_PRETRAIN_DIR = Path(__file__).resolve().parent / "Save"
+
+
+def _default_checkpoint_str(filename: str) -> Optional[str]:
+    """存在则返回默认 checkpoint 路径，不存在就老实返回 None。"""
+    checkpoint_path = DEFAULT_PRETRAIN_DIR / filename
+    if checkpoint_path.exists():
+        return str(checkpoint_path)
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,9 +81,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sam-model-type", type=str, default="vit_b")
     parser.add_argument("--sam-checkpoint", type=str, default='/home/chenxu/Aya/checkpoints/sam/sam_vit_b_01ec64.pth')
     parser.add_argument("--sam-device", type=str, default="cuda:0")
-    parser.add_argument("--source-encoder-checkpoint", type=str, default=None)
-    parser.add_argument("--target-encoder-checkpoint", type=str, default=None)
-    parser.add_argument("--decoder-checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--source-encoder-checkpoint",
+        type=str,
+        default=_default_checkpoint_str("SE_source_picai_noL2.pth"),
+    )
+    parser.add_argument(
+        "--target-encoder-checkpoint",
+        type=str,
+        default=_default_checkpoint_str("SE_target_picai_noL2.pth"),
+    )
+    parser.add_argument(
+        "--decoder-checkpoint",
+        type=str,
+        default=_default_checkpoint_str("SD_picai_noL2.pth"),
+    )
     parser.add_argument("--save-every", type=int, default=1)
     return parser.parse_args()
 
@@ -102,6 +123,29 @@ def load_optional_checkpoint(
     if checkpoint_path is None:
         return
     load_pretrained_weights(module, checkpoint_path, strict=True, map_location=map_location)
+
+
+def resolve_training_checkpoint_paths(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """解析训练初始化权重路径，并在 target 缺失时回退到 source 热启动。"""
+    source_checkpoint = args.source_encoder_checkpoint
+    target_checkpoint = args.target_encoder_checkpoint
+    decoder_checkpoint = args.decoder_checkpoint
+
+    if target_checkpoint is None and source_checkpoint is not None:
+        # target 分支如果裸随机起跑，后面的 teacher 也会跟着是随机老师。
+        # 这里直接回退到 source encoder 热启动，先把训练起点放在一个像样的位置。
+        target_checkpoint = source_checkpoint
+
+    return source_checkpoint, target_checkpoint, decoder_checkpoint
+
+
+def build_frozen_model_copy(module: nn.Module) -> nn.Module:
+    """复制一个冻结的 eval 模型副本。"""
+    module_copy = copy.deepcopy(module)
+    module_copy.eval()
+    for parameter in module_copy.parameters():
+        parameter.requires_grad = False
+    return module_copy
 
 
 def _prototype_exists(prototype_bank: DynamicBoundaryPrototypeBank, a: int, b: int) -> bool:
@@ -444,17 +488,19 @@ def save_checkpoint(
     output_dir: Path,
     epoch: int,
     se_source: Encoder,
+    se_source_ema: Encoder,
     se_target: Encoder,
+    se_target_ema: Encoder,
     sd: Decoder,
-    teacher_se_target: Encoder,
-    teacher_sd: Decoder,
+    sd_ema: Decoder,
 ) -> None:
     """保存当前 epoch 的学生和教师权重。"""
     torch.save(se_source.state_dict(), output_dir / f"SE_source_{epoch}.pth")
+    torch.save(se_source_ema.state_dict(), output_dir / f"SE_source_ema_{epoch}.pth")
     torch.save(se_target.state_dict(), output_dir / f"SE_target_{epoch}.pth")
     torch.save(sd.state_dict(), output_dir / f"SD_{epoch}.pth")
-    torch.save(teacher_se_target.state_dict(), output_dir / f"SE_target_ema_{epoch}.pth")
-    torch.save(teacher_sd.state_dict(), output_dir / f"SD_ema_{epoch}.pth")
+    torch.save(se_target_ema.state_dict(), output_dir / f"SE_target_ema_{epoch}.pth")
+    torch.save(sd_ema.state_dict(), output_dir / f"SD_ema_{epoch}.pth")
 
 
 def main() -> None:
@@ -467,6 +513,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sam_device = torch.device(args.sam_device) if args.sam_device is not None else device
+    source_checkpoint, target_checkpoint, decoder_checkpoint = resolve_training_checkpoint_paths(args)
 
     source_transform = RandomGenerator(output_size=(192, 192), SpatialAug=True, IntensityAug=True, NonlinearAug=False)
     target_transform = RandomGenerator(output_size=(192, 192), SpatialAug=True, IntensityAug=True, NonlinearAug=False)
@@ -497,16 +544,22 @@ def main() -> None:
     se_source = Encoder().to(device)
     se_target = Encoder().to(device)
     sd = Decoder(num_class=args.num_classes).to(device)
-    load_optional_checkpoint(se_source, args.source_encoder_checkpoint, map_location=device)
-    load_optional_checkpoint(se_target, args.target_encoder_checkpoint, map_location=device)
-    load_optional_checkpoint(sd, args.decoder_checkpoint, map_location=device)
+    load_optional_checkpoint(se_source, source_checkpoint, map_location=device)
+    load_optional_checkpoint(se_target, target_checkpoint, map_location=device)
+    load_optional_checkpoint(sd, decoder_checkpoint, map_location=device)
 
-    teacher_se_target = copy.deepcopy(se_target).to(device)
-    teacher_sd = copy.deepcopy(sd).to(device)
-    teacher_se_target.eval()
-    teacher_sd.eval()
-    for parameter in itertools.chain(teacher_se_target.parameters(), teacher_sd.parameters()):
-        parameter.requires_grad = False
+    print(f"[init] source_encoder_checkpoint={source_checkpoint}")
+    print(f"[init] target_encoder_checkpoint={target_checkpoint}")
+    print(f"[init] decoder_checkpoint={decoder_checkpoint}")
+
+    # 训练里专门产伪标签的 teacher，按 epoch 更新，整个 epoch 内保持固定。
+    teacher_se_target = build_frozen_model_copy(se_target)
+    teacher_sd = build_frozen_model_copy(sd)
+
+    # 专门保存和测试的 EMA 权重，按 iter 更新，行为对齐参考训练脚本。
+    se_source_ema = build_frozen_model_copy(se_source)
+    se_target_ema = build_frozen_model_copy(se_target)
+    sd_ema = build_frozen_model_copy(sd)
 
     optimizer = torch.optim.AdamW(
         itertools.chain(se_source.parameters(), se_target.parameters(), sd.parameters()),
@@ -590,8 +643,9 @@ def main() -> None:
             total_loss.backward()
             optimizer.step()
 
-            update_ema_variables(se_target, teacher_se_target, alpha=float(args.ema_alpha))
-            update_ema_variables(sd, teacher_sd, alpha=float(args.ema_alpha))
+            update_ema_variables(se_source, se_source_ema, alpha=float(args.ema_alpha))
+            update_ema_variables(se_target, se_target_ema, alpha=float(args.ema_alpha))
+            update_ema_variables(sd, sd_ema, alpha=float(args.ema_alpha))
 
             train_iterator.set_postfix(
                 total=float(total_loss.item()),
@@ -600,15 +654,20 @@ def main() -> None:
                 prompts=len(prompt_result_list),
             )
 
+        # 伪标签 teacher 只在 epoch 结束后更新一次，避免同一轮内老师一直漂。
+        update_ema_variables(se_target, teacher_se_target, alpha=float(args.ema_alpha))
+        update_ema_variables(sd, teacher_sd, alpha=float(args.ema_alpha))
+
         if (epoch + 1) % int(args.save_every) == 0:
             save_checkpoint(
                 output_dir=output_dir,
                 epoch=epoch,
                 se_source=se_source,
+                se_source_ema=se_source_ema,
                 se_target=se_target,
+                se_target_ema=se_target_ema,
                 sd=sd,
-                teacher_se_target=teacher_se_target,
-                teacher_sd=teacher_sd,
+                sd_ema=sd_ema,
             )
 
 

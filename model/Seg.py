@@ -197,6 +197,73 @@ def _strip_module_prefix(state_dict: Mapping[str, torch.Tensor]) -> "OrderedDict
     return cleaned_state_dict
 
 
+def _rename_state_dict_prefix(
+    state_dict: Mapping[str, torch.Tensor],
+    prefix_mapping: Mapping[str, str],
+) -> "OrderedDict[str, torch.Tensor]":
+    """按前缀映射重写旧 checkpoint 的层名。"""
+    renamed_state_dict: "OrderedDict[str, torch.Tensor]" = OrderedDict()
+    sorted_prefix_pairs = sorted(prefix_mapping.items(), key=lambda item: len(item[0]), reverse=True)
+    for key, value in state_dict.items():
+        new_key = key
+        for old_prefix, new_prefix in sorted_prefix_pairs:
+            if key == old_prefix or key.startswith(f"{old_prefix}."):
+                new_key = new_prefix + key[len(old_prefix):]
+                break
+        renamed_state_dict[new_key] = value
+    return renamed_state_dict
+
+
+def _maybe_upgrade_legacy_state_dict(
+    module: nn.Module,
+    state_dict: Mapping[str, torch.Tensor],
+) -> "OrderedDict[str, torch.Tensor]":
+    """兼容旧版平铺命名的 encoder/decoder checkpoint。"""
+    state_keys = set(state_dict.keys())
+
+    if isinstance(module, Encoder) and "block1.0.weight" in state_keys:
+        encoder_prefix_mapping = {
+            "block1.0": "block1.0.0",
+            "block1.1": "block1.0.1",
+            "block1.3": "block1.1.0",
+            "block1.4": "block1.1.1",
+            "block1.6": "block1.2.0",
+            "block1.7": "block1.2.1",
+            "block2.0": "block2.0.0",
+            "block2.1": "block2.0.1",
+            "block2.3": "block2.1.0",
+            "block2.4": "block2.1.1",
+            "block2.6": "block2.2.0",
+            "block2.7": "block2.2.1",
+            "block3.0": "block3.0.0",
+            "block3.1": "block3.0.1",
+            "block3.3": "block3.1.0",
+            "block3.4": "block3.1.1",
+            "block3.6": "block3.2.0",
+            "block3.7": "block3.2.1",
+        }
+        return _rename_state_dict_prefix(state_dict, encoder_prefix_mapping)
+
+    if isinstance(module, Decoder) and "block1.3.weight" in state_keys:
+        decoder_prefix_mapping = {
+            "block1.3": "block1.3.0",
+            "block1.4": "block1.3.1",
+            "block1.6": "block1.4.0",
+            "block1.7": "block1.4.1",
+            "block2.3": "block2.3.0",
+            "block2.4": "block2.3.1",
+            "block2.6": "block2.4.0",
+            "block2.7": "block2.4.1",
+            "block3.3": "block3.3.0",
+            "block3.4": "block3.3.1",
+            "block3.6": "block3.4.0",
+            "block3.7": "block3.4.1",
+        }
+        return _rename_state_dict_prefix(state_dict, decoder_prefix_mapping)
+
+    return OrderedDict(state_dict)
+
+
 def load_pretrained_weights(
     module: nn.Module,
     checkpoint_path: str | Path,
@@ -207,5 +274,6 @@ def load_pretrained_weights(
     checkpoint = torch.load(Path(checkpoint_path).expanduser().resolve(), map_location=map_location)
     state_dict = _extract_state_dict(checkpoint)
     state_dict = _strip_module_prefix(state_dict)
+    state_dict = _maybe_upgrade_legacy_state_dict(module, state_dict)
     incompatible = module.load_state_dict(state_dict, strict=strict)
     return incompatible
